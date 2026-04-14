@@ -46,6 +46,7 @@ const char gModulationStr[MODULATION_UKNOWN][4] = {
     [MODULATION_FM]="FM",
     [MODULATION_AM]="AM",
     [MODULATION_USB]="USB",
+    [MODULATION_CW]="CW",
 
 #ifdef ENABLE_BYP_RAW_DEMODULATORS
     [MODULATION_BYP]="BYP",
@@ -252,28 +253,6 @@ void RADIO_InitInfo(VFO_Info_t *pInfo, const uint16_t ChannelSave, const uint32_
     RADIO_ConfigureSquelchAndOutputPower(pInfo);
 }
 
-void RADIO_ValidateAndSetCode(FREQ_Config_t *pFreq_Config, uint8_t tmp) {
-    switch (pFreq_Config->CodeType) {
-        default:
-        case CODE_TYPE_OFF:
-            pFreq_Config->CodeType = CODE_TYPE_OFF;
-            tmp = 0;
-            break;
-
-        case CODE_TYPE_CONTINUOUS_TONE:
-            if (tmp > (ARRAY_SIZE(CTCSS_Options) - 1))
-                tmp = 0;
-            break;
-
-        case CODE_TYPE_DIGITAL:
-        case CODE_TYPE_REVERSE_DIGITAL:
-            if (tmp > (ARRAY_SIZE(DCS_Options) - 1))
-                tmp = 0;
-            break;
-    }
-    pFreq_Config->Code = tmp;
-}
-
 void RADIO_ConfigureChannel(const unsigned int VFO, const unsigned int configure)
 {
     VFO_Info_t *pVfo = &gEeprom.VfoInfo[VFO];
@@ -347,7 +326,7 @@ void RADIO_ConfigureChannel(const unsigned int VFO, const unsigned int configure
     }
 
     pVfo->Band                    = band;
-    pVfo->SCANLIST_PARTICIPATION  = bParticipation;
+    pVfo->SCANLIST_PARTICIPATION = bParticipation;
     pVfo->CHANNEL_SAVE            = channel;
 
     uint32_t base;
@@ -392,8 +371,49 @@ void RADIO_ConfigureChannel(const unsigned int VFO, const unsigned int configure
         pVfo->freq_config_RX.CodeType = (data[2] >> 0) & 0x0F;
         pVfo->freq_config_TX.CodeType = (data[2] >> 4) & 0x0F;
 
-        RADIO_ValidateAndSetCode(&pVfo->freq_config_RX, data[0]);
-        RADIO_ValidateAndSetCode(&pVfo->freq_config_TX, data[1]);
+        tmp = data[0];
+        switch (pVfo->freq_config_RX.CodeType)
+        {
+            default:
+            case CODE_TYPE_OFF:
+                pVfo->freq_config_RX.CodeType = CODE_TYPE_OFF;
+                tmp = 0;
+                break;
+
+            case CODE_TYPE_CONTINUOUS_TONE:
+                if (tmp > (ARRAY_SIZE(CTCSS_Options) - 1))
+                    tmp = 0;
+                break;
+
+            case CODE_TYPE_DIGITAL:
+            case CODE_TYPE_REVERSE_DIGITAL:
+                if (tmp > (ARRAY_SIZE(DCS_Options) - 1))
+                    tmp = 0;
+                break;
+        }
+        pVfo->freq_config_RX.Code = tmp;
+
+        tmp = data[1];
+        switch (pVfo->freq_config_TX.CodeType)
+        {
+            default:
+            case CODE_TYPE_OFF:
+                pVfo->freq_config_TX.CodeType = CODE_TYPE_OFF;
+                tmp = 0;
+                break;
+
+            case CODE_TYPE_CONTINUOUS_TONE:
+                if (tmp > (ARRAY_SIZE(CTCSS_Options) - 1))
+                    tmp = 0;
+                break;
+
+            case CODE_TYPE_DIGITAL:
+            case CODE_TYPE_REVERSE_DIGITAL:
+                if (tmp > (ARRAY_SIZE(DCS_Options) - 1))
+                    tmp = 0;
+                break;
+        }
+        pVfo->freq_config_TX.Code = tmp;
 
         if (data[4] == 0xFF)
         {
@@ -839,14 +859,27 @@ void RADIO_SetupRegisters(bool switchToForeground)
     #else
         Frequency = gRxVfo->pRX->Frequency;
     #endif
-    BK4819_SetFrequency(Frequency);
+
+    // Frequencies are in 10Hz units. CW RX uses USB demod with an audio tone of 650Hz,
+    // so we tune 650Hz lower than the displayed/carrier frequency.
+    uint32_t RadioFrequency = Frequency;
+    if (gRxVfo->Modulation == MODULATION_CW) {
+        const uint32_t cwOffset_10Hz = 65u; // 650Hz
+        if (RadioFrequency > cwOffset_10Hz) {
+            RadioFrequency -= cwOffset_10Hz;
+        } else {
+            RadioFrequency = 0;
+        }
+    }
+
+    BK4819_SetFrequency(RadioFrequency);
 
     BK4819_SetupSquelch(
         gRxVfo->SquelchOpenRSSIThresh,    gRxVfo->SquelchCloseRSSIThresh,
         gRxVfo->SquelchOpenNoiseThresh,   gRxVfo->SquelchCloseNoiseThresh,
         gRxVfo->SquelchCloseGlitchThresh, gRxVfo->SquelchOpenGlitchThresh);
 
-    BK4819_PickRXFilterPathBasedOnFrequency(Frequency);
+    BK4819_PickRXFilterPathBasedOnFrequency(RadioFrequency);
 
     // what does this in do ?
     BK4819_ToggleGpioOut(BK4819_GPIO0_PIN28_RX_ENABLE, true);
@@ -1124,6 +1157,10 @@ void RADIO_SetModulation(ModulationMode_t modulation)
         case MODULATION_USB:
             mod = BK4819_AF_BASEBAND2;
             break;
+        case MODULATION_CW:
+            // CW RX reuses USB demod; the RX frequency shift is handled elsewhere.
+            mod = BK4819_AF_BASEBAND2;
+            break;
 
     }
 
@@ -1158,6 +1195,24 @@ void RADIO_SetModulation(ModulationMode_t modulation)
         }
 
         case MODULATION_USB:
+        case MODULATION_CW:
+        {
+            uint16_t uVar1 = BK4819_ReadRegister(0x31);
+            BK4819_WriteRegister(0x31, uVar1 & 0xfffe); // AM Demodulation Disable
+            BK4819_WriteRegister(0x42, 0x6b5a);
+            BK4819_WriteRegister(0x2a, 0x7400);
+            BK4819_WriteRegister(0x2b, 0x0000);
+            BK4819_WriteRegister(0x2f, 0x9890);
+
+            #ifdef ENABLE_FEAT_F4HWN_AUDIO
+                AUDIO_ApplyUSBProfile();
+            #else
+                BK4819_WriteRegister(0x54, 0x9009);
+                BK4819_WriteRegister(0x55, 0x31a9);
+            #endif
+            break;
+        }
+
         case MODULATION_FM:
         default:
         {
@@ -1169,10 +1224,7 @@ void RADIO_SetModulation(ModulationMode_t modulation)
             BK4819_WriteRegister(0x2f, 0x9890);
 
             #ifdef ENABLE_FEAT_F4HWN_AUDIO
-                if (modulation == MODULATION_USB)
-                    AUDIO_ApplyUSBProfile();
-                else
-                    AUDIO_ApplyFMProfile(gSetting_set_audio_fm);
+                AUDIO_ApplyFMProfile(gSetting_set_audio_fm);
             #else
                 BK4819_WriteRegister(0x54, 0x9009);
                 BK4819_WriteRegister(0x55, 0x31a9);
@@ -1182,7 +1234,7 @@ void RADIO_SetModulation(ModulationMode_t modulation)
     }
     
     BK4819_SetRegValue(afDacGainRegSpec, 0xF);
-    BK4819_WriteRegister(BK4819_REG_3D, modulation == MODULATION_USB ? 0 : 0x2AAB);
+    BK4819_WriteRegister(BK4819_REG_3D, (modulation == MODULATION_USB || modulation == MODULATION_CW) ? 0 : 0x2AAB);
     BK4819_SetRegValue(afcDisableRegSpec, modulation != MODULATION_FM);
 
     RADIO_SetupAGC(modulation == MODULATION_AM, false);
@@ -1286,7 +1338,7 @@ void RADIO_PrepareTX(void)
     }
 #endif
 #ifndef ENABLE_TX_WHEN_AM
-    else if (gCurrentVfo->Modulation != MODULATION_FM) {
+    else if (gCurrentVfo->Modulation != MODULATION_FM && gCurrentVfo->Modulation != MODULATION_CW) {
         // not allowed to TX if in AM mode
         State = VFO_STATE_TX_DISABLE;
     }
@@ -1364,28 +1416,45 @@ void RADIO_PrepareTX(void)
 
 void RADIO_SendCssTail(void)
 {
-    if (gEeprom.TAIL_TONE_ELIMINATION) {
-        switch (gCurrentVfo->pTX->CodeType) {
-        case CODE_TYPE_DIGITAL:
-        case CODE_TYPE_REVERSE_DIGITAL:
-            BK4819_PlayCDCSSTail();
-            break;
-        default:
-            BK4819_PlayCTCSSTail();
-            break;
-        }
-
-        SYSTEM_DelayMs(200);
+    switch (gCurrentVfo->pTX->CodeType) {
+    case CODE_TYPE_DIGITAL:
+    case CODE_TYPE_REVERSE_DIGITAL:
+        BK4819_PlayCDCSSTail();
+        break;
+    default:
+        BK4819_PlayCTCSSTail();
+        break;
     }
+
+    SYSTEM_DelayMs(200);
 }
 
 void RADIO_SendEndOfTransmission(void)
 {
+    if (gCurrentVfo != NULL && gCurrentVfo->Modulation == MODULATION_CW) {
+        // CW: pure carrier keyed by PTT; no roger/DTMF/tail tones.
+
+        // Stop any local sidetone/tone generator.
+        BK4819_WriteRegister(BK4819_REG_70, 0x0000);
+        BK4819_WriteRegister(BK4819_REG_71, 0x0000);
+        BK4819_SetAF(BK4819_AF_MUTE);
+
+        // Restore REG_40 default (it is normally set during BK init).
+        BK4819_WriteRegister((BK4819_REGISTER_t)0x40U, 0x3516);
+
+        AUDIO_AudioPathOff();
+        gEnableSpeaker = false;
+
+        RADIO_SetupRegisters(false);
+        return;
+    }
+
     BK4819_PlayRoger();
     DTMF_SendEndOfTransmission();
 
     // send the CTCSS/DCS tail tone - allows the receivers to mute the usual FM squelch tail/crash
-    RADIO_SendCssTail();
+    if(gEeprom.TAIL_TONE_ELIMINATION)
+        RADIO_SendCssTail();
     RADIO_SetupRegisters(false);
 }
 
@@ -1395,6 +1464,7 @@ void RADIO_PrepareCssTX(void)
 
     SYSTEM_DelayMs(200);
 
-    RADIO_SendCssTail();
+    if(gEeprom.TAIL_TONE_ELIMINATION)
+        RADIO_SendCssTail();
     RADIO_SetupRegisters(true);
 }
