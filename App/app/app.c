@@ -1362,19 +1362,25 @@ void APP_TimeSlice10ms(void)
     if (gCurrentFunction != FUNCTION_POWER_SAVE || !gRxIdleMode)
         CheckRadioInterrupts();
 
+    const bool isCwTx = (gCurrentFunction == FUNCTION_TRANSMIT
+                         && gCurrentVfo != NULL
+                         && gCurrentVfo->Modulation == MODULATION_CW);
+
     if (gCurrentFunction == FUNCTION_TRANSMIT)
     {   // transmitting
 #if defined(ENABLE_AUDIO_BAR) && !defined(ENABLE_FEAT_F4HWN_AUDIO_SCOPE)
-        if (gSetting_mic_bar && (gFlashLightBlinkCounter % (150 / 10)) == 0) // once every 150ms
+        if (!isCwTx && gSetting_mic_bar && (gFlashLightBlinkCounter % (150 / 10)) == 0) // once every 150ms
             UI_DisplayAudioBar();
 #endif
     }
 
 #ifdef ENABLE_FEAT_F4HWN_AUDIO_SCOPE
-    if (gSetting_mic_bar && (gFlashLightBlinkCounter % (20 / 10)) == 0) // once every 20ms
+    if (!isCwTx && gSetting_mic_bar && (gFlashLightBlinkCounter % (20 / 10)) == 0) // once every 20ms
         // Sample audio amplitude and refresh display during TX only (FM RX has no usable audio register)
         UI_DisplayAudioScope();
 #endif
+
+    UI_MAIN_CWDecoderTimeSlice10ms();
 
     bool gUpdateDisplayCurrent = gUpdateDisplay;
     bool gUpdateStatusCurrent  = gUpdateStatus;

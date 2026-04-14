@@ -70,6 +70,311 @@ const char *VfoStateStr[] = {
        [VFO_STATE_VOLTAGE_HIGH]="VOLT HIGH"
 };
 
+#define CW_DECODE_TEXT_LEN 17
+#define CW_DECODE_SYMBOL_MAX 5
+
+static char sCwDecodedText[CW_DECODE_TEXT_LEN + 1];
+static char sCwCurrentSymbol[CW_DECODE_SYMBOL_MAX + 1];
+static uint8_t sCwCurrentSymbolLen;
+static uint16_t sCwPressTicks;
+static uint16_t sCwGapTicks;
+static uint16_t sCwDotTicks = 12; // 120ms baseline
+static uint16_t sCwDashSplitCount;
+static uint16_t sCwSidetonePhaseTicks;
+static uint16_t sCwScrollOffsetPx;
+static uint8_t sCwScrollTick10ms;
+static uint8_t sCwBlankInsertPxAcc;
+static uint16_t sCwLastDotInsertGapTicks;
+static bool sCwSidetoneEnabled;
+static bool sCwWasPressed;
+static bool sCwWordSpaceAdded;
+static bool sCwModeWasActive;
+
+typedef struct {
+    const char *pattern;
+    char value;
+} CwMapEntry_t;
+
+static const CwMapEntry_t sCwMap[] = {
+    {".-", 'A'},   {"-...", 'B'}, {"-.-.", 'C'}, {"-..", 'D'},  {".", 'E'},
+    {"..-.", 'F'}, {"--.", 'G'},  {"....", 'H'}, {"..", 'I'},   {".---", 'J'},
+    {"-.-", 'K'},  {".-..", 'L'}, {"--", 'M'},   {"-.", 'N'},   {"---", 'O'},
+    {".--.", 'P'}, {"--.-", 'Q'}, {".-.", 'R'},  {"...", 'S'},  {"-", 'T'},
+    {"..-", 'U'},  {"...-", 'V'}, {".--", 'W'},  {"-..-", 'X'}, {"-.--", 'Y'},
+    {"--..", 'Z'},
+    {"-----", '0'}, {".----", '1'}, {"..---", '2'}, {"...--", '3'}, {"....-", '4'},
+    {".....", '5'}, {"-....", '6'}, {"--...", '7'}, {"---..", '8'}, {"----.", '9'}
+};
+
+static bool UI_MAIN_IsCWModeVisible(void)
+{
+    return gScreenToDisplay == DISPLAY_MAIN
+        && (gEeprom.VfoInfo[0].Modulation == MODULATION_CW
+            || gEeprom.VfoInfo[1].Modulation == MODULATION_CW);
+}
+
+static void UI_MAIN_CWClearState(void)
+{
+    memset(sCwDecodedText, 0, sizeof(sCwDecodedText));
+    memset(sCwCurrentSymbol, 0, sizeof(sCwCurrentSymbol));
+    sCwCurrentSymbolLen = 0;
+    sCwPressTicks = 0;
+    sCwGapTicks = 0;
+    sCwDotTicks = 12;
+    sCwDashSplitCount = 0;
+    sCwSidetonePhaseTicks = 0;
+    sCwScrollOffsetPx = 0;
+    sCwScrollTick10ms = 0;
+    sCwBlankInsertPxAcc = 0;
+    sCwLastDotInsertGapTicks = 0;
+    sCwSidetoneEnabled = false;
+    sCwWasPressed = false;
+    sCwWordSpaceAdded = false;
+}
+
+static void UI_MAIN_CWAppendChar(char c)
+{
+    size_t len = strlen(sCwDecodedText);
+    if (len >= CW_DECODE_TEXT_LEN) {
+        memmove(sCwDecodedText, sCwDecodedText + 1, CW_DECODE_TEXT_LEN - 1);
+        sCwDecodedText[CW_DECODE_TEXT_LEN - 1] = c;
+        sCwDecodedText[CW_DECODE_TEXT_LEN] = '\0';
+    } else {
+        sCwDecodedText[len] = c;
+        sCwDecodedText[len + 1] = '\0';
+    }
+}
+
+static char UI_MAIN_CWDecodeSymbol(const char *symbol)
+{
+    for (unsigned int i = 0; i < ARRAY_SIZE(sCwMap); i++) {
+        if (strcmp(symbol, sCwMap[i].pattern) == 0)
+            return sCwMap[i].value;
+    }
+    return '?';
+}
+
+static void UI_MAIN_CWFinalizeCurrentSymbol(void)
+{
+    if (sCwCurrentSymbolLen == 0)
+        return;
+
+    sCwCurrentSymbol[sCwCurrentSymbolLen] = '\0';
+    UI_MAIN_CWAppendChar(UI_MAIN_CWDecodeSymbol(sCwCurrentSymbol));
+
+    memset(sCwCurrentSymbol, 0, sizeof(sCwCurrentSymbol));
+    sCwCurrentSymbolLen = 0;
+    sCwWordSpaceAdded = false;
+    // New decoded character starts at the right edge, then scrolls left.
+    sCwScrollOffsetPx = 0;
+    gUpdateDisplay = true;
+}
+
+static void UI_MAIN_CWSetSidetone(bool enable)
+{
+    if (enable == sCwSidetoneEnabled)
+        return;
+
+    if (enable) {
+        BK4819_TransmitTone(true, 650);
+    } else {
+        BK4819_WriteRegister(BK4819_REG_70, 0x0000);
+        BK4819_WriteRegister(BK4819_REG_71, 0x0000);
+        BK4819_SetAF(BK4819_AF_MUTE);
+    }
+
+    sCwSidetoneEnabled = enable;
+}
+
+void UI_MAIN_CWDecoderTimeSlice10ms(void)
+{
+    const bool cwActive = UI_MAIN_IsCWModeVisible();
+
+    if (cwActive != sCwModeWasActive) {
+        sCwModeWasActive = cwActive;
+        UI_MAIN_CWClearState();
+        gUpdateDisplay = true;
+    }
+
+    if (!cwActive)
+        return;
+
+    const bool isPressed = GPIO_IsPttPressed();
+    const bool isCwTx = (gCurrentFunction == FUNCTION_TRANSMIT
+                         && gCurrentVfo != NULL
+                         && gCurrentVfo->Modulation == MODULATION_CW);
+
+    // Smooth marquee effect: 1 pixel step every 2 seconds.
+    if (++sCwScrollTick10ms >= 200) {
+        sCwScrollTick10ms = 0;
+        sCwScrollOffsetPx++;
+
+        // When no new symbol is being keyed, push a blank token into the decoded stream.
+        // With the 1px dot stream behind it, this makes old decoded chars drift out and disappear.
+        if (!isPressed && sCwCurrentSymbolLen == 0 && sCwDecodedText[0] != '\0') {
+            // Insert one blank only after a full character-width worth of pixel scrolling.
+            if (++sCwBlankInsertPxAcc >= 7) {
+                sCwBlankInsertPxAcc = 0;
+                UI_MAIN_CWAppendChar(' ');
+            }
+        } else {
+            sCwBlankInsertPxAcc = 0;
+        }
+
+        gUpdateDisplay = true;
+    }
+
+    if (isCwTx && isPressed) {
+        const uint16_t dotTicks = MAX((uint16_t)3, sCwDotTicks);
+        const uint16_t periodTicks = MAX((uint16_t)8, (uint16_t)(dotTicks * 4)); // 3 on + 1 off
+        const uint16_t onTicks = MAX((uint16_t)6, (uint16_t)(dotTicks * 3));
+        const bool toneOn = sCwSidetonePhaseTicks < onTicks;
+        UI_MAIN_CWSetSidetone(toneOn);
+        sCwSidetonePhaseTicks = (sCwSidetonePhaseTicks + 1) % periodTicks;
+    } else {
+        sCwSidetonePhaseTicks = 0;
+        UI_MAIN_CWSetSidetone(false);
+    }
+
+    if (isPressed) {
+        if (!sCwWasPressed) {
+            sCwPressTicks = 0;
+            sCwGapTicks = 0;
+            sCwDashSplitCount = 0;
+            sCwLastDotInsertGapTicks = 0;
+            sCwWordSpaceAdded = false;
+        }
+
+        if (sCwPressTicks < 1000)
+            sCwPressTicks++;
+
+        // Long hold in CW is split into repeated dah symbols.
+        const uint16_t dashTicks = MAX((uint16_t)6, (uint16_t)(sCwDotTicks * 3));
+        const uint16_t splitPeriodTicks = MAX((uint16_t)8, (uint16_t)(sCwDotTicks * 4)); // dah + short gap
+        while (sCwPressTicks >= dashTicks + (sCwDashSplitCount * splitPeriodTicks)
+               && sCwCurrentSymbolLen < CW_DECODE_SYMBOL_MAX) {
+            sCwCurrentSymbol[sCwCurrentSymbolLen++] = '-';
+            sCwCurrentSymbol[sCwCurrentSymbolLen] = '\0';
+            sCwDashSplitCount++;
+            gUpdateDisplay = true;
+        }
+    } else {
+        if (sCwWasPressed) {
+            if (sCwDashSplitCount == 0) {
+                const uint16_t dotDashThreshold = MAX((uint16_t)4, (uint16_t)(sCwDotTicks * 2));
+                const char symbol = (sCwPressTicks <= dotDashThreshold) ? '.' : '-';
+
+                if (symbol == '.')
+                    sCwDotTicks = (uint16_t)((sCwDotTicks * 3 + MAX((uint16_t)3, sCwPressTicks)) / 4);
+
+                if (sCwCurrentSymbolLen < CW_DECODE_SYMBOL_MAX) {
+                    sCwCurrentSymbol[sCwCurrentSymbolLen++] = symbol;
+                    sCwCurrentSymbol[sCwCurrentSymbolLen] = '\0';
+                }
+            }
+
+            sCwPressTicks = 0;
+            sCwGapTicks = 0;
+            sCwDashSplitCount = 0;
+            gUpdateDisplay = true;
+        } else {
+            // Commit a letter only after a clearly longer pause between symbols.
+            // This avoids splitting close dah/dah or dit/dit as separate letters.
+            const uint16_t letterGapTicks = MAX((uint16_t)16, (uint16_t)(sCwDotTicks * 4));
+            const uint16_t wordGapTicks = MAX((uint16_t)30, (uint16_t)(sCwDotTicks * 8));
+
+            if (sCwGapTicks < 1000)
+                sCwGapTicks++;
+
+            if (sCwCurrentSymbolLen > 0 && sCwGapTicks >= letterGapTicks)
+                UI_MAIN_CWFinalizeCurrentSymbol();
+
+            if (sCwCurrentSymbolLen == 0
+                && !sCwWordSpaceAdded
+                && sCwDecodedText[0] != '\0'
+                && sCwGapTicks >= wordGapTicks) {
+                // For long silence, use text-space separator only.
+                // Dot motion is already provided by the 1px stream renderer.
+                UI_MAIN_CWAppendChar(' ');
+                sCwWordSpaceAdded = true;
+                sCwScrollOffsetPx = 0;
+                gUpdateDisplay = true;
+            }
+        }
+    }
+
+    sCwWasPressed = isPressed;
+}
+
+static void UI_MAIN_DrawCWDecoderLine(void)
+{
+#ifdef ENABLE_FEAT_F4HWN
+    const unsigned int line = isMainOnly() ? 5 : 3;
+#else
+    const unsigned int line = 3;
+#endif
+    const unsigned int symbolStartX = 0; // left aligned
+    const unsigned int charSpacing = 7;
+    uint8_t *p_line = gFrameBuffer[line];
+
+    // Left side: current keying pattern (dot/dash), fixed bracketed field.
+    char symbolInner[CW_DECODE_SYMBOL_MAX + 1];
+    memset(symbolInner, 0, sizeof(symbolInner));
+    if (sCwCurrentSymbolLen > 0)
+        snprintf(symbolInner, sizeof(symbolInner), "%s", sCwCurrentSymbol);
+
+    // Real-time preview while key is still pressed.
+    if (sCwWasPressed && sCwCurrentSymbolLen < CW_DECODE_SYMBOL_MAX && sCwDashSplitCount == 0) {
+        const uint16_t dotDashThreshold = MAX((uint16_t)4, (uint16_t)(sCwDotTicks * 2));
+        const char preview = (sCwPressTicks <= dotDashThreshold) ? '.' : '-';
+        const size_t len = strlen(symbolInner);
+        symbolInner[len] = preview;
+        symbolInner[len + 1] = '\0';
+    }
+    // Center current symbols within fixed 5-char field.
+    char centeredInner[CW_DECODE_SYMBOL_MAX + 1];
+    memset(centeredInner, ' ', CW_DECODE_SYMBOL_MAX);
+    centeredInner[CW_DECODE_SYMBOL_MAX] = '\0';
+    const unsigned int innerLen = strlen(symbolInner);
+    const unsigned int copyLen = MIN(innerLen, (unsigned int)CW_DECODE_SYMBOL_MAX);
+    const unsigned int innerStart = (CW_DECODE_SYMBOL_MAX - copyLen) / 2;
+    memcpy(centeredInner + innerStart, symbolInner, copyLen);
+
+    char symbolText[CW_DECODE_SYMBOL_MAX + 3];
+    snprintf(symbolText, sizeof(symbolText), "[%s]", centeredInner);
+    const unsigned int symbolWidthPx = strlen(symbolText) * 7; // 6px glyph + 1px spacing
+    const unsigned int streamLeftX = symbolStartX + symbolWidthPx + 1;
+    const unsigned int streamRightX = LCD_WIDTH - 1;
+
+    // Clear the stream area each frame so scrolled-out text disappears.
+    if (streamRightX >= streamLeftX)
+        memset(p_line + streamLeftX, 0, streamRightX - streamLeftX + 1);
+    UI_PrintStringSmallNormal(symbolText, symbolStartX, 0, line);
+
+    // Right-aligned stream area base: 1px moving dots.
+    for (unsigned int x = streamLeftX; x <= streamRightX; x++) {
+        if (((x + sCwScrollOffsetPx) % 4u) == 0u)
+            p_line[x] = 0x40;
+    }
+
+    if (sCwDecodedText[0] == '\0')
+        return;
+
+    // Overlay decoded chars on top of the same moving dot stream.
+    const unsigned int maxRightChars = (streamRightX >= streamLeftX) ? ((streamRightX - streamLeftX + 1) / charSpacing) : 0;
+    if (maxRightChars == 0)
+        return;
+    const unsigned int textLen = strlen(sCwDecodedText);
+    const unsigned int drawLen = MIN(textLen, maxRightChars);
+    const char *drawPtr = sCwDecodedText + (textLen - drawLen);
+    const unsigned int streamWidth = streamRightX - streamLeftX + 1;
+    const unsigned int baseX = streamLeftX + (streamWidth - (drawLen * charSpacing)); // right aligned
+    const unsigned int scrollRange = (baseX >= streamLeftX) ? (baseX - streamLeftX + 1) : 1;
+    const unsigned int shift = (scrollRange > 0) ? (sCwScrollOffsetPx % scrollRange) : 0;
+    const unsigned int x = baseX - shift;
+    UI_PrintStringSmallNormal(drawPtr, x, 0, line);
+}
+
 // ----------------------------------------
 
 static void DrawSmallPowerBars(uint8_t *p, unsigned int level)
@@ -1609,6 +1914,14 @@ void UI_DisplayMain(void)
     {   // we're free to use the middle line
 
         const bool rx = FUNCTION_IsRx();
+        const bool showCwDecoder = UI_MAIN_IsCWModeVisible();
+
+        if (showCwDecoder)
+        {
+            center_line = CENTER_LINE_IN_USE;
+            UI_MAIN_DrawCWDecoderLine();
+        }
+        else
 
 #ifdef ENABLE_FEAT_F4HWN_AUDIO_SCOPE
         if (gSetting_mic_bar && gCurrentFunction == FUNCTION_TRANSMIT) {

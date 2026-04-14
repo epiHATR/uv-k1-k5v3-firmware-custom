@@ -46,6 +46,7 @@ void UI_DisplayAudioBar(void);
 #ifdef ENABLE_FEAT_F4HWN_AUDIO_SCOPE
 void UI_DisplayAudioScope(void);
 #endif
+void UI_MAIN_CWDecoderTimeSlice10ms(void);
 void UI_MAIN_TimeSlice500ms(void);
 void UI_DisplayMain(void);
 
