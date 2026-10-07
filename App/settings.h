@@ -25,6 +25,10 @@
 #include "radio.h"
 #include <driver/backlight.h>
 
+/* Shared PY25Q16 locations for the two configurable boot-message lines. */
+#define SETTINGS_BOOT_MESSAGE_LINE1_ADDR 0x00A0C8u
+#define SETTINGS_BOOT_MESSAGE_LINE2_ADDR 0x00A0D8u
+
 enum POWER_OnDisplayMode_t {
 #ifdef ENABLE_FEAT_F4HWN
     POWER_ON_DISPLAY_MODE_ALL,
@@ -129,7 +133,10 @@ enum {
 enum {
     DUAL_WATCH_OFF = 0,
     DUAL_WATCH_CHAN_A,
-    DUAL_WATCH_CHAN_B
+    DUAL_WATCH_CHAN_B,
+#ifdef ENABLE_FEAT_F4HWN_FULL_WATCH
+    DUAL_WATCH_FULL
+#endif
 };
 
 enum {
@@ -150,60 +157,47 @@ enum {
 };
 
 enum ACTION_OPT_t {
-    ACTION_OPT_NONE = 0,
-    ACTION_OPT_FLASHLIGHT,
-    ACTION_OPT_POWER,
-    ACTION_OPT_MONITOR,
-    ACTION_OPT_SCAN,
-    ACTION_OPT_VOX,
-    ACTION_OPT_ALARM,
-    ACTION_OPT_FM,
-    ACTION_OPT_1750,
-    ACTION_OPT_KEYLOCK,
-    ACTION_OPT_A_B,
-    ACTION_OPT_VFO_MR,
-    ACTION_OPT_SWITCH_DEMODUL,
-    ACTION_OPT_BLMIN_TMP_OFF, //BackLight Minimum Temporay OFF
-#ifdef ENABLE_FEAT_F4HWN
-    ACTION_OPT_RXMODE,
-    ACTION_OPT_MAINONLY,
-    ACTION_OPT_PTT,
-    ACTION_OPT_WN,
-    ACTION_OPT_BACKLIGHT,
-    ACTION_OPT_MUTE,
-    ACTION_OPT_RXA,
-    #ifdef ENABLE_FEAT_F4HWN_RESCUE_OPS
-        ACTION_OPT_POWER_HIGH,
-        ACTION_OPT_REMOVE_OFFSET,
-    #endif
-#endif
-#ifdef ENABLE_REGA
-    ACTION_OPT_REGA_ALARM,
-    ACTION_OPT_REGA_TEST,
-#endif
-#ifdef ENABLE_CW_MODULATOR
-	ACTION_OPT_PLAY_CWMSG1,
-	ACTION_OPT_PLAY_CWMSG2,
-	ACTION_OPT_PLAY_CWMSG3,
-	ACTION_OPT_PLAY_CWMSG4,
-	ACTION_OPT_REPEAT_CWMSG1,
-	ACTION_OPT_REPEAT_CWMSG2,
-	ACTION_OPT_REPEAT_CWMSG3,
-	ACTION_OPT_REPEAT_CWMSG4,
-#endif
-#if defined(ENABLE_CW_MODULATOR) && defined(ENABLE_CODE_PRACTICE)
-    ACTION_OPT_CPO,
-#endif
-#ifdef ENABLE_FEAT_F4HWN_BEAM
-    ACTION_OPT_BEAM,
-#endif
-#ifdef ENABLE_FEAT_F4HWN_RXTX_LOG
-    ACTION_OPT_RXTX_LOG,
-#endif
-#ifdef ENABLE_FEAT_F4HWN_FOXHUNT
-    ACTION_OPT_FOXHUNT,
-#endif
-    ACTION_OPT_LEN
+    /* Persisted in EEPROM: never renumber or make these values conditional. */
+    ACTION_OPT_NONE           = 0,
+    ACTION_OPT_FLASHLIGHT     = 1,
+    ACTION_OPT_POWER          = 2,
+    ACTION_OPT_MONITOR        = 3,
+    ACTION_OPT_SCAN           = 4,
+    ACTION_OPT_VOX            = 5,
+    ACTION_OPT_FM             = 6,
+    ACTION_OPT_1750           = 7,
+    ACTION_OPT_KEYLOCK        = 8,
+    ACTION_OPT_A_B            = 9,
+    ACTION_OPT_VFO_MR         = 10,
+    ACTION_OPT_SWITCH_DEMODUL = 11,
+    ACTION_OPT_RXMODE         = 12,
+    ACTION_OPT_MAINONLY       = 13,
+    ACTION_OPT_PTT            = 14,
+    ACTION_OPT_WN             = 15,
+    ACTION_OPT_MUTE           = 16,
+    ACTION_OPT_RXA            = 17,
+
+    /* Preset-specific actions keep their IDs even when not compiled. */
+    ACTION_OPT_RXTX_LOG       = 18,
+    ACTION_OPT_BEAM           = 19,
+    ACTION_OPT_POWER_HIGH     = 20,
+    ACTION_OPT_REMOVE_OFFSET  = 21,
+    ACTION_OPT_FOXHUNT        = 22,
+    ACTION_OPT_BEACON         = 23,
+
+    /* NR7Y CW actions. Fixed IDs appended after Armel's so they never shift
+     * values already stored in EEPROM. */
+    ACTION_OPT_PLAY_CWMSG1    = 24,
+    ACTION_OPT_PLAY_CWMSG2    = 25,
+    ACTION_OPT_PLAY_CWMSG3    = 26,
+    ACTION_OPT_PLAY_CWMSG4    = 27,
+    ACTION_OPT_REPEAT_CWMSG1  = 28,
+    ACTION_OPT_REPEAT_CWMSG2  = 29,
+    ACTION_OPT_REPEAT_CWMSG3  = 30,
+    ACTION_OPT_REPEAT_CWMSG4  = 31,
+    ACTION_OPT_CPO            = 32,
+
+    ACTION_OPT_LEN            = 33
 };
 
 #ifdef ENABLE_VOICE
@@ -215,12 +209,6 @@ enum ACTION_OPT_t {
     };
     typedef enum VOICE_Prompt_t VOICE_Prompt_t;
 #endif
-
-enum ALARM_Mode_t {
-    ALARM_MODE_SITE = 0,
-    ALARM_MODE_TONE
-};
-typedef enum ALARM_Mode_t ALARM_Mode_t;
 
 enum ROGER_Mode_t {
     ROGER_MODE_OFF = 0,
@@ -290,6 +278,7 @@ typedef struct {
     uint8_t               BACKLIGHT_TIME;
     uint8_t               SCAN_RESUME_MODE;
     uint8_t               SCAN_LIST_DEFAULT;
+    uint32_t              SCAN_LIST_MIX_MASK;
     bool                  SCAN_LIST_ENABLED;
     uint16_t              SCANLIST_PRIORITY_CH[6];
 //#ifdef ENABLE_FEAT_F4HWN_RESUME_STATE // Fix me !!! What the hell is this?
@@ -304,9 +293,6 @@ typedef struct {
     uint8_t               field38_0x33;
 
     uint8_t               AUTO_KEYPAD_LOCK;
-#if defined(ENABLE_ALARM) || defined(ENABLE_TX1750)
-    ALARM_Mode_t      ALARM_MODE;
-#endif
     POWER_OnDisplayMode_t POWER_ON_DISPLAY_MODE;
     ROGER_Mode_t          ROGER;
     uint8_t               REPEATER_TAIL_TONE_ELIMINATION;
@@ -368,9 +354,6 @@ typedef struct {
 
     uint8_t               KEY_M_LONG_PRESS_ACTION;
     uint8_t               BACKLIGHT_MIN;
-#ifdef ENABLE_BLMIN_TMP_OFF
-    BLMIN_STAT_t          BACKLIGHT_MIN_STAT;
-#endif
     uint8_t               BACKLIGHT_MAX;
     BATTERY_Type_t        BATTERY_TYPE;
 #ifdef ENABLE_RSSI_BAR
@@ -411,11 +394,18 @@ typedef struct {
     PTT_ID_t         dtmfPttIdTxMode;
 } ChannelScanDisplayInfo_t;
 
+#ifdef ENABLE_FEAT_F4HWN_MULTIBOOT_HOT_CFG
+void     SETTINGS_InitEEPROM(bool preserve_display_mode);
+#else
 void     SETTINGS_InitEEPROM(void);
+#endif
 void     SETTINGS_LoadCalibration(void);
 uint32_t SETTINGS_FetchChannelFrequency(const uint16_t channel);
 bool     SETTINGS_FetchChannelScanInfo(const uint16_t channel, uint32_t *frequency, ModulationMode_t *modulation);
 bool     SETTINGS_FetchChannelScanDisplayInfo(const uint16_t channel, ChannelScanDisplayInfo_t *info);
+#if defined(ENABLE_FEAT_F4HWN_FULL_WATCH) || defined(ENABLE_FEAT_F4HWN_SCAN_FASTER)
+void     SETTINGS_ApplyChannelScanDisplayInfo(VFO_Info_t *vfo, uint16_t channel, const ChannelScanDisplayInfo_t *info);
+#endif
 void     SETTINGS_FetchChannelName(char *s, const uint16_t channel);
 void     SETTINGS_FactoryReset(bool bIsAll);
 #ifdef ENABLE_FMRADIO
@@ -428,7 +418,6 @@ void SETTINGS_SaveChannelName(uint16_t channel, const char * name);
 void SETTINGS_SaveChannel(uint16_t Channel, uint8_t VFO, const VFO_Info_t *pVFO, uint8_t Mode);
 void SETTINGS_SaveBatteryCalibration(const uint16_t * batteryCalibration);
 void SETTINGS_UpdateChannel(uint16_t channel, const VFO_Info_t *pVFO, bool keep);
-void SETTINGS_WriteBuildOptions(void);
 #ifdef ENABLE_FEAT_F4HWN_RESUME_STATE
     void SETTINGS_WriteCurrentState(void);
 #endif

@@ -51,15 +51,14 @@ static const AddrMapping_t ADDR_MAPPINGS[] = {
     _MK_MAPPING(0x008000, 0x008000, 0x00886E),  // 1024 MR  + 7 VFO Attributes * 2 Bytes (ex 0x002000) 0x008000 -> 0x00880E
                                                 // List name * 4 Bytes 0x00880E -> 0x00886E
 
-    _MK_MAPPING(0x009000, 0x009000, 0x0090E7),  // 14 VFO * 16 Bytes = 0x9000 -> 0x90E0 (the old
+    _MK_MAPPING(0x009000, 0x009000, 0x0090E8),  // 14 VFO * 16 Bytes = 0x9000 -> 0x90E0 (the old
                                                 // 0x90D6 bound was 10 B short: it truncated the
                                                 // 470 MHz VFO1 record at 0x90D0 -> 0x90DF)
-                                                // Fox Hunt settings * 7 Bytes       0x90E0 -> 0x90E7
-                                                // (ENABLE_FEAT_F4HWN_FOXHUNT, written directly by
-                                                // app/foxhunt.c; concatenated here so aircopy clones
-                                                // them together with the VFOs)
+                                                // Fox Hunt / Beacon settings * 8 Bytes 0x90E0 -> 0x90E8
+                                                // (written directly by app/foxhunt.c; concatenated
+                                                // here so aircopy clones them with the VFOs)
 
-    _MK_MAPPING(0x00A000, 0x00A000, 0x00A170),  // Settings * 16 Bytes (ex 0x004000)        0x00A000 -> 0x00A010
+    _MK_MAPPING(0x00A000, 0x00A000, 0x00A178),  // Settings * 16 Bytes (ex 0x004000)        0x00A000 -> 0x00A010
                                                 // Settings * 16 Bytes (ex 0x005000)        0x00A010 -> 0x00A020
                                                 // Settings FM * 8 Bytes (0x006000)         0x00A020 -> 0x00A028
                                                 // MR FM * 128 Bytes (0x003000)             0x00A028 -> 0x00A0A8
@@ -71,6 +70,7 @@ static const AddrMapping_t ADDR_MAPPINGS[] = {
                                                 // Settings * 8 Bytes (0x00B000)            0x00A150 -> 0x00A158
                                                 // Settings F4HWN * 8 Bytes (0x00C000)      0x00A158 -> 0x00A160
                                                 // Settings Version * 16 Bytes              0x00A160 -> 0x00A170
+                                                // Settings Mixed Scan Lists * 8 Bytes      0x00A170 -> 0x00A178
 
     _MK_MAPPING(0x010000, 0x00B000, 0x00B200),  // Calibration 512 Bytes!!!
 
@@ -110,11 +110,8 @@ void EEPROM_ReadBuffer(uint16_t Address, void *pBuffer, uint8_t Size)
     }
 }
 
-void EEPROM_WriteBuffer(uint16_t Address, const void *pBuffer)
+void EEPROM_WriteBuffer(uint16_t Address, const void *pBuffer, uint8_t Size)
 {
-    // Write 8 bytes!!
-
-    uint16_t Size = 8;
     while (Size)
     {
         uint32_t PY_Addr;

@@ -111,10 +111,6 @@ bool              gSetting_ScrambleEnable;
 
 enum BacklightOnRxTx_t gSetting_backlight_on_tx_rx;
 
-#ifdef ENABLE_AM_FIX
-    bool          gSetting_AM_fix = true;
-#endif
-
 #ifdef ENABLE_FEAT_F4HWN_SLEEP 
     uint8_t       gSetting_set_off = 1;
     bool          gWakeUp = false;
@@ -152,9 +148,6 @@ enum BacklightOnRxTx_t gSetting_backlight_on_tx_rx;
     uint8_t       gDW = 0;
     uint8_t       gCB = 0;
     bool          gSaveRxMode = false;
-    uint8_t       crc[15] = { 0 };
-    uint8_t       lErrorsDuringAirCopy = 0;
-    uint8_t       gAircopyStep = 0;
     uint8_t       gAircopyCurrentMapIndex = 0;
     bool          gAirCopyBootMode = 0;
     #ifdef ENABLE_FEAT_F4HWN_RESCUE_OPS
@@ -251,8 +244,8 @@ bool              gCssBackgroundScan;
 volatile bool     gScheduleScanListen = true;
 volatile uint16_t gScanPauseDelayIn_10ms;
 
-#if defined(ENABLE_ALARM) || defined(ENABLE_TX1750)
-    AlarmState_t  gAlarmState;
+#ifdef ENABLE_TX1750
+    bool gTx1750Active;
 #endif
 uint16_t          gMenuCountdown;
 bool              gPttWasReleased;
@@ -265,7 +258,7 @@ bool              gFlagResetVfos;
 bool              gRequestSaveVFO;
 uint16_t          gRequestSaveChannel;
 bool              gRequestSaveSettings;
-#ifdef ENABLE_FMRADIO
+#ifdef ENABLE_FMRADIO_EMBEDDED
     bool          gRequestSaveFM;
 #endif
 bool              gFlagPrepareTX;
@@ -273,7 +266,7 @@ bool              gFlagPrepareTX;
 bool              gFlagAcceptSetting;
 bool              gFlagRefreshSetting;
 
-#ifdef ENABLE_FMRADIO
+#ifdef ENABLE_FMRADIO_EMBEDDED
     bool          gFlagSaveFM;
 #endif
 bool              g_CDCSS_Lost;
@@ -295,10 +288,6 @@ uint16_t          gNextMrChannel;
 ReceptionMode_t   gRxReceptionMode;
 
 bool              gRxVfoIsActive;
-#ifdef ENABLE_ALARM
-    uint8_t       gAlarmToneCounter;
-    uint16_t      gAlarmRunningCounter;
-#endif
 bool              gKeyBeingHeld;
 bool              gPttIsPressed;
 uint8_t           gPttDebounceCounter;
@@ -330,7 +319,7 @@ volatile bool     gNextTimeslice40ms;
     volatile bool     gScheduleNOAA       = true;
 #endif
 volatile bool     gFlagTailNoteEliminationComplete;
-#ifdef ENABLE_FMRADIO
+#ifdef ENABLE_FMRADIO_EMBEDDED
     volatile bool gScheduleFM;
 #endif
 
