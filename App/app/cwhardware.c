@@ -94,7 +94,7 @@ static void CW_ReadSideButton(bool *ring_out)
     static bool last_reported = false;
     if (ring != last_reported) {
 #if ENABLE_CW_HARDWARE_DEBUG
-        sprintf_(dbg_buf, "CW_ReadSideButton: stable=%u reg=0x%08X match=%u ring=%u\r\n", (unsigned)(match_count>=2), (unsigned)reg, (unsigned)match_count, (unsigned)ring);
+        sprintf_(dbg_buf, "CW_ReadSideButton: stable=%u reg=%u match=%u ring=%u\r\n", (unsigned)(match_count>=2), (unsigned)reg, (unsigned)match_count, (unsigned)ring);
         UART_Send(dbg_buf, strlen(dbg_buf));
 #endif
         last_reported = ring;
@@ -131,7 +131,7 @@ static bool CW_ReadGpioDeglitched(GPIO_TypeDef *gpio_port, uint32_t pin_mask, bo
     }
 #if ENABLE_CW_HARDWARE_DEBUG
     char dbg_buf[80];
-    sprintf_(dbg_buf, "%s: s=%u r=0x%08X m=%u r=%u\r\n", label, (unsigned)(i>=goal), (unsigned)reg, (unsigned)i, (unsigned)result);
+    sprintf_(dbg_buf, "%s: s=%u r=%u m=%u r=%u\r\n", label, (unsigned)(i>=goal), (unsigned)reg, (unsigned)i, (unsigned)result);
     // UART_Send is a no-op here: USART1 (PA10) is disabled whenever
     // CW_ConfigurePortGround(true) is active (Port Handkey and friends), which
     // is exactly when this print is most useful. Route over USB CDC instead -
@@ -331,9 +331,9 @@ static void usb_dbg_dump_all(void)
     for (uint8_t i = 0; i < s_dbg_count; i++) {
         usb_dbg_entry_t *e = &s_dbg_buf[i];
         char buf[96];
-        sprintf_(buf, "USB %u t=%u/%u(%u) tm=%08X r=%u/%u(%u) rm=%08X\r\n",
-            (unsigned)e->t_ms, e->tip_active, GLITCH_SAMPLES, (unsigned)e->tip_state, e->tip_mask,
-            e->ring_active, GLITCH_SAMPLES, (unsigned)e->ring_state, e->ring_mask);
+        sprintf_(buf, "USB %u t=%u/%u(%u) tm=%u r=%u/%u(%u) rm=%u\r\n",
+            (unsigned)e->t_ms, e->tip_active, GLITCH_SAMPLES, (unsigned)e->tip_state, (unsigned)e->tip_mask,
+            e->ring_active, GLITCH_SAMPLES, (unsigned)e->ring_state, (unsigned)e->ring_mask);
         UART_Send(buf, strlen(buf));
     }
     s_dbg_count = 0;
