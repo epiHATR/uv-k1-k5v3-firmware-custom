@@ -853,29 +853,87 @@ void UI_DisplayAudioBar(void)
 #endif
 
 #ifdef ENABLE_CW_MODULATOR
+/* Marquee for the CW decode center line (1 px / 100 ms while the bar is visible). */
+static uint16_t sCwMarqueeOffsetPx;
+static uint8_t  sCwMarqueeTick10ms;
+static uint8_t  sCwMarqueeLastLen;
+
+void UI_MAIN_CWDecodeMarqueeTimeSlice10ms(void)
+{
+	const bool visible = (gCW_TX_Display[0] != 0)
+		&& (gCurrentFunction == FUNCTION_TRANSMIT
+			|| gCW_TxDisplayHoldoff_10ms > 0);
+
+	if (!visible) {
+		sCwMarqueeTick10ms = 0;
+		return;
+	}
+
+	if (++sCwMarqueeTick10ms >= 10) {
+		sCwMarqueeTick10ms = 0;
+		sCwMarqueeOffsetPx++;
+		gUpdateDisplay = true;
+	}
+}
+
+/* Draw small-font text clipped to [clipL, clipR). Start may be off-screen. */
+static void UI_MAIN_PrintSmallClipped(const char *text, int startX, unsigned int line,
+                                      unsigned int clipL, unsigned int clipR)
+{
+	const unsigned int pitch = FONT_SMALL_WIDTH + 1u;
+
+	for (unsigned int i = 0; text[i] != '\0'; i++) {
+		const int cx = startX + (int)(i * pitch);
+		if (cx + (int)pitch <= (int)clipL || cx >= (int)clipR)
+			continue;
+		if (cx < (int)clipL || cx + (int)pitch > (int)clipR)
+			continue; /* skip partially clipped glyphs */
+
+		char tmp[2] = { text[i], '\0' };
+		UI_PrintStringSmallNormal(tmp, (uint8_t)cx, 0, (uint8_t)line);
+	}
+}
+
 void DrawCWDecodeBar(void)
 {
-	const unsigned int line = 3;
+	/* Main-only / big-freq uses line 5; dual-VFO keeps the middle gap on line 3. */
+#ifdef ENABLE_FEAT_F4HWN
+	const unsigned int line = isMainOnly() ? 5u : 3u;
+#else
+	const unsigned int line = 3u;
+#endif
 	uint8_t *p_line = gFrameBuffer[line];
-	char String[20];
-	
+	char String[CW_TX_DISPLAY_SIZE];
+	const unsigned int textLeft = sizeof(BITMAP_Play) + 2u; /* play glyph + gap */
+	const unsigned int pitch = FONT_SMALL_WIDTH + 1u;
+	const unsigned int zoneW = LCD_WIDTH - textLeft;
+
 	if (gScreenToDisplay != DISPLAY_MAIN)
-		return;  // screen is in use
-	
+		return;
+
 	memset(p_line, 0, LCD_WIDTH);
-	
-	// Get the last 20 characters from display buffer
-	CW_GetTxDisplayTail(String, sizeof(String));
 
-	// Print the text shifted right so glyph can be placed at x=0; print text first
-	UI_PrintStringSmallNormal(String, 10, 0, line);
+	const uint8_t len = CW_GetTxDisplayTail(String, sizeof(String));
+	if (len != sCwMarqueeLastLen) {
+		/* New character: re-anchor at the right edge of the zone. */
+		sCwMarqueeLastLen = len;
+		sCwMarqueeOffsetPx = 0;
+	}
 
-	// Draw glyph after text so it can't be clobbered (drawn independently of DecodeBar)
+	if (len > 0 && zoneW > pitch) {
+		const unsigned int textW = len * pitch;
+		/* Enter from the right, scroll left across the full zone, then wrap. */
+		const unsigned int period = textW + zoneW;
+		const unsigned int phase = (period > 0) ? (sCwMarqueeOffsetPx % period) : 0;
+		const int startX = (int)(textLeft + zoneW) - (int)phase;
+
+		UI_MAIN_PrintSmallClipped(String, startX, line, textLeft, LCD_WIDTH);
+	}
+
 	if (gCW_PlaybackActive && (center_line == CENTER_LINE_NONE || center_line == CENTER_LINE_CW_DECODE)) {
 		if (gCW_PlayIndicatorOn) {
 			memcpy(p_line + 0, BITMAP_Play, sizeof(BITMAP_Play));
 		} else {
-			// clear the glyph area
 			memset(p_line + 0, 0, sizeof(BITMAP_Play));
 		}
 	}
