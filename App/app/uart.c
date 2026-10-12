@@ -45,6 +45,7 @@
 
 #include "functions.h"
 #include "misc.h"
+#include "radio.h"
 #include "settings.h"
 #include "version.h"
 
@@ -891,6 +892,78 @@ static uint32_t mb_port_timestamp(uint32_t Port)
 }
 #endif
 
+/* Live VFO tune. Works on every preset that has USB or UART.
+ * Payload: VFO (0/1), frequency in 10 Hz units LE (145.5 MHz = 14550000),
+ * modulation (0xFF = keep, else ModulationMode_t of this build).
+ * Does not require ENABLE_EXTRA_UART_CMD or ENABLE_CW_MODULATOR.
+ * Applies through the same save path as keypad frequency entry. */
+static void CMD_0531_SetVfo(uint32_t Port, const uint8_t *pBuffer)
+{
+    typedef struct __attribute__((packed)) {
+        Header_t Header;
+        uint8_t  Vfo;
+        uint32_t Frequency;
+        uint8_t  Modulation;
+    } CMD_0531_t;
+
+    const CMD_0531_t *cmd = (const CMD_0531_t *)pBuffer;
+
+    struct __attribute__((packed)) {
+        Header_t Header;
+        uint8_t  Status;
+        uint8_t  Vfo;
+        uint32_t Frequency;
+    } Reply;
+
+    uint8_t status = 0;
+    uint32_t applied = 0;
+
+    if (cmd->Header.Size < 6u)
+        return;
+
+    if (cmd->Vfo > 1u)
+        status = 1;
+    else if (gCurrentFunction == FUNCTION_TRANSMIT)
+        status = 3;
+    else if (RX_freq_check(cmd->Frequency) != 0)
+        status = 2;
+    else if (cmd->Modulation != 0xFFu && cmd->Modulation >= MODULATION_UKNOWN)
+        status = 4;
+    else
+    {
+        const uint8_t vfo = cmd->Vfo;
+        const FREQUENCY_Band_t band = FREQUENCY_GetBand(cmd->Frequency);
+        VFO_Info_t *pVfo;
+
+        gEeprom.TX_VFO = vfo;
+        gEeprom.ScreenChannel[vfo] = (uint16_t)(FREQ_CHANNEL_FIRST + band);
+        gEeprom.FreqChannel[vfo] = (uint16_t)(FREQ_CHANNEL_FIRST + band);
+
+        RADIO_ConfigureChannel(vfo, VFO_CONFIGURE_RELOAD);
+
+        pVfo = &gEeprom.VfoInfo[vfo];
+        applied = FREQUENCY_RoundToStep(cmd->Frequency, pVfo->StepFrequency);
+        if (RX_freq_check(applied) != 0)
+            applied = cmd->Frequency;
+
+        pVfo->freq_config_RX.Frequency = applied;
+        if (cmd->Modulation != 0xFFu)
+            pVfo->Modulation = (ModulationMode_t)cmd->Modulation;
+
+        gTxVfo = pVfo;
+        gRequestSaveChannel = 1;
+        gRequestSaveVFO = true;
+        gUpdateDisplay = true;
+    }
+
+    Reply.Header.ID = 0x0532;
+    Reply.Header.Size = 6;
+    Reply.Status = status;
+    Reply.Vfo = cmd->Vfo;
+    Reply.Frequency = applied;
+    SendReply(Port, &Reply, sizeof(Reply));
+}
+
 void UART_HandleCommand(uint32_t Port)
 {
     UART_Command_t *pUART_Command;
@@ -968,6 +1041,10 @@ void UART_HandleCommand(uint32_t Port)
             CMD_052F(Port, pUART_Command->Buffer);
             break;
 #endif
+
+        case 0x0531:
+            CMD_0531_SetVfo(Port, pUART_Command->Buffer);
+            break;
 
         case 0x05DD: // reset
             #if defined(ENABLE_OVERLAY)

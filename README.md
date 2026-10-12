@@ -73,6 +73,7 @@ Special thanks to Jean-Cyrille F6IWW (3 times), Fabrice 14RC123, David F4BPP (2 
 * [Main Features from Egzumer](#main-features-from-egzumer)
 * [Manual](#manual)
 * [Compiling and Building from Docker](#compiling-and-Building-from-docker)
+* [Live VFO control](#live-vfo-control)
 * [Flashing the Firmware with UV Studio](#flashing-the-firmware-with-uv-studio)
 * [Credits](#credits)
 * [Other sources of information](#other-sources-of-information)
@@ -541,6 +542,23 @@ remains an explicit Git operation.
 
 - The first run may take a few minutes while Docker builds the base image.
 - Each build runs inside Docker, so your host environment remains clean.
+
+## Live VFO control
+
+`tools/k1ctl.py` tunes the live VFO over USB serial (command `0x0531`). The command is compiled into every preset, including Fusion and CW. Flash a build that includes it, leave the radio on the main screen, and connect USB. On the CW edition, USB-paddle keyer mode takes the USB pins and hides the serial port, so leave that mode off.
+
+Run the script from a virtual environment so `pyserial` stays out of the system Python.
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r tools/requirements.txt
+
+python tools/k1ctl.py --port /dev/cu.usbmodemXXXX 145.5
+python tools/k1ctl.py --port /dev/cu.usbmodemXXXX --vfo 1 --mod AM 433.5
+```
+
+On Windows, activate with `.venv\Scripts\activate`. USB CDC ignores the baud rate. Omit `--mod` to keep the current modulation. `--mod CW` is accepted only by a firmware build that includes CW.
 
 ## Flashing the Firmware with UV Studio
 
