@@ -238,14 +238,40 @@ const char* const gSubMenu_SFT_D[] =
     "-"
 };
 
+// Two entries, always. Which pair applies depends on the modulation of the VFO
+// being edited - CW and SSB never use the 12.5k filter, so they get their own
+// labels. UI_MENU_FilterLabels() picks the pair; the stored value is the same
+// wide/narrow bit either way.
 const char* const gSubMenu_W_N[] =
 {
 	"25k FM",
 	"12k FM",
-#ifdef ENABLE_EXTRA_FILTER
-	"N 2k"
-#endif
 };
+
+#ifdef ENABLE_EXTRA_FILTER
+const char* const gSubMenu_W_N_SSB[] =
+{
+	"6.25k",
+	"2.0k",
+};
+#endif
+
+// Label pair for the filter menu, chosen from the modulation. The status line
+// stays at plain W/N; this is the picking context, so it shows the real widths.
+const char* const *UI_MENU_FilterLabels(void)
+{
+#ifdef ENABLE_EXTRA_FILTER
+	if (
+	#ifdef ENABLE_CW_MODULATOR
+		gTxVfo->Modulation == MODULATION_CW ||
+	#endif
+		gTxVfo->Modulation == MODULATION_USB)
+	{
+		return gSubMenu_W_N_SSB;
+	}
+#endif
+	return gSubMenu_W_N;
+}
 
 const char* const gSubMenu_OFF_ON[] =
 {
@@ -1224,8 +1250,8 @@ void UI_DisplayMenu(void)
             break;
 
         case MENU_W_N:
-            choiceTable = gSubMenu_W_N;
-            goto copy_menu_choice;
+            strcpy(String, UI_MENU_FilterLabels()[gSubMenuSelection]);
+            break;
 
 #ifndef ENABLE_FEAT_F4HWN
         case MENU_SCR:

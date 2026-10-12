@@ -396,13 +396,10 @@ void ACTION_SwitchDemodul(void)
 
 void ACTION_SwitchFilter(void)
 {
-	gTxVfo->CHANNEL_BANDWIDTH++;
-#ifdef ENABLE_EXTRA_FILTER
-	if (gTxVfo->CHANNEL_BANDWIDTH > BANDWIDTH_NARROWEST)
-#else
-	if (gTxVfo->CHANNEL_BANDWIDTH > BANDWIDTH_NARROW)
-#endif
-		gTxVfo->CHANNEL_BANDWIDTH = BANDWIDTH_WIDE;
+	// One bit, so this is a straight toggle. What wide and narrow resolve to
+	// depends on the modulation - see RADIO_ResolveFilter().
+	gTxVfo->CHANNEL_BANDWIDTH = (gTxVfo->CHANNEL_BANDWIDTH == BANDWIDTH_WIDE)
+		? BANDWIDTH_NARROW : BANDWIDTH_WIDE;
 	gRequestSaveChannel  = 1;
 	gFlagReconfigureVfos = true;
 }
@@ -639,7 +636,13 @@ void ACTION_FM(void)
         gBeepToPlay = BEEP_500HZ_60MS_DOUBLE_BEEP_OPTIONAL;
     return;
 #else
-    if (gCurrentFunction != FUNCTION_TRANSMIT && gCurrentFunction != FUNCTION_MONITOR)
+    // Only an in-progress transmission blocks the toggle. FUNCTION_MONITOR used
+    // to block it too, but ENABLE_CW_MODULATOR forces gMonitor (and therefore
+    // FUNCTION_MONITOR) on for CW and USB, which made this a silent no-op in
+    // exactly the modes this firmware spends most of its time in. Monitor is
+    // torn down below anyway: gMonitor is cleared and RADIO_SetupRegisters(true)
+    // puts us back in FUNCTION_FOREGROUND before FM_Start().
+    if (gCurrentFunction != FUNCTION_TRANSMIT)
     {
         gInputBoxIndex = 0;
 
@@ -647,6 +650,11 @@ void ACTION_FM(void)
             FM_TurnOff();
             gFlagReconfigureVfos  = true;
             gRequestDisplayScreen = DISPLAY_MAIN;
+
+#ifdef ENABLE_CW_MODULATOR
+            // Re-arm the keyer if we're returning to a CW channel.
+            CW_KeyerReconfigure(gTxVfo->Modulation == MODULATION_CW);
+#endif
 
 #ifdef ENABLE_VOX
             gVoxResumeCountdown = 80;
@@ -671,6 +679,19 @@ void ACTION_FM(void)
         }
 
         RADIO_SelectVfos();
+
+        // Both of these have to happen AFTER RADIO_SelectVfos(), which re-asserts
+        // gMonitor and re-arms the keyer for CW/USB channels - doing them first
+        // just gets the work undone.
+        gMonitor = false;
+#ifdef ENABLE_CW_MODULATOR
+        // Park the keyer before handing the radio to the BK1080. CW_AppUpdate()
+        // keys on gTxVfo->Modulation, not on gFmRadioMode, so an armed keyer
+        // would otherwise still be polling paddles - and still holding PA10 -
+        // while the user is listening to broadcast FM.
+        CW_KeyerReconfigure(false);
+#endif
+
         RADIO_SetupRegisters(true);
 
         FM_Start();
@@ -911,7 +932,7 @@ void ACTION_Wn(void)
 
     if (pVfo->Modulation == MODULATION_AM)
     {
-        BK4819_SetFilterBandwidth(RADIO_GetAMFilterBandwidth(pVfo), true);
+        BK4819_SetFilterBandwidth(RADIO_ResolveFilter(pVfo), true);
         return;
     }
 

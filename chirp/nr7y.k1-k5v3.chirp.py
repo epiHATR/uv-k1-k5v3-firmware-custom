@@ -215,6 +215,22 @@ ul16 NoaaChannel_B;
 
 // --------------------
 
+// FM broadcast receiver config, 0x00A020..0x00A023. Mirrors the packed fmCfg
+// struct in settings.c (SETTINGS_SaveFM / the 0x00A020 read in
+// SETTINGS_InitEEPROM): selFreq, selChn, then a bitfield byte. GCC packs that
+// bitfield from the LSB up, so isMrMode is bit 0 and band is bits 2..1; the
+// firmware memsets the whole 8-byte record to 0xFF before filling it, which is
+// why the top five bits read back as ones. Bytes 0x00A024..0x00A027 are that
+// 0xFF padding and are deliberately left unmapped.
+#seekto 0x00A020;
+ul16 fm_selected_frequency;
+u8   fm_selected_channel;
+u8   __UNUSED_FM:5,
+     fm_band:2,
+     fm_is_mr_mode:1;
+
+// --------------------
+
 #seekto 0x00A028;
 ul16 fmfreq[48];
 
@@ -365,6 +381,12 @@ u8 set_pwr:4,
 struct {
     char version[16];
 } version;
+
+// EEPROM layout schema marker. Spare byte of the mixed-scan record so it does
+// not collide with the scan-list mask at 0x00A170. Pre-v1.4 firmware never
+// wrote this byte, so it reads back as erased 0xFF. See NR7Y_SCHEMA_* above.
+#seekto 0x00A177;
+u8 schema;
 
 // --------------------
 
@@ -539,11 +561,44 @@ TALK_TIME_LIST = ["N/U", "N/U", "N/U", "N/U", "N/U", "30 sec", "35 sec", "40 sec
 # Set NFM value
 SET_NFM_LIST = ["NARROW", "NARROWER"]
 
-# Per-channel CW/SSB bandwidth. Firmware reuses the TXLock bit for CW/USB
-# channels to select the 2.0kHz "narrowest" RF filter instead (TX_LOCK is
-# inapplicable to those modes and is forced off whenever this applies - see
-# RADIO_ConfigureChannel in radio.c).
-NR7Y_CW_SSB_BANDWIDTH_LIST = ["NARROW", "NARROWEST"]
+# ---- EEPROM schema -------------------------------------------------------
+# Schema 1 (pre-v1.4 firmware) borrowed bit 6 of the channel flags byte as a
+# NARROWEST selector on CW/USB channels, so TX_LOCK could never be set there.
+# Schema 2 gives bit 6 back to TX_LOCK and keeps the filter in bit 1 as a plain
+# wide/narrow flag, with the firmware deciding what those mean per modulation
+# (FM 25k/12.5k, CW and SSB 6.25k/2.0k).
+#
+# Schema 1 is read-only: an image is upgraded in memory on load and only ever
+# written back as schema 2. Pre-v1.4 firmware never wrote the marker, so it
+# reads back as erased 0xFF.
+NR7Y_SCHEMA_ADDR = 0x00A177
+NR7Y_SCHEMA_LEGACY = 1
+NR7Y_SCHEMA_CURRENT = 2
+
+# modulation -> (wide name, narrow name). CW and USB have no narrow mode string
+# in chirp_common.MODES, so their bandwidth bit rides in an Extra rather than in
+# the mode, and both entries are the same name.
+_NR7Y_MODE_NAME = {
+    0: ("FM", "NFM"),
+    1: ("AM", "NAM"),
+    2: ("USB", "USB"),
+    3: ("CW", "CW"),
+}
+
+# mode name -> (modulation, bandwidth). A bandwidth of None means the mode
+# string does not determine the bit - it comes from the Bandwidth extra.
+_NR7Y_MODE_BITS = {
+    "FM":  (0, 0),
+    "NFM": (0, 1),
+    "AM":  (1, 0),
+    "NAM": (1, 1),
+    "USB": (2, None),
+    "CW":  (3, None),
+}
+
+# Wide/narrow as the user sees it. The firmware translates per modulation, so
+# CHIRP deliberately does not talk in kilohertz here.
+NR7Y_BANDWIDTH_LIST = ["Wide", "Narrow"]
 
 # Set RxA value
 SET_RXA_FM_LIST = ["FLAT", "CLEAN", "MID", "BOOST", "MAX"]
@@ -680,9 +735,35 @@ MEM_BLOCK =     0x80        # largest block of memory that we can reliably write
 CAL_START =     0x00B000    # calibration memory start address
 F4HWN_START =   0x00A158    # calibration F4HWN memory start address
 
-# fm radio supported frequencies
-FMMIN = 76.0
-FMMAX = 108.0
+# FM broadcast receiver.
+#
+# The BK1080 has four selectable bands (BK1080_GetFreqLoLimit /
+# BK1080_GetFreqHiLimit in driver/bk1080.c). The firmware treats a stored
+# channel as tunable when lo <= freq < hi, so the upper bound is exclusive:
+# band 0 tops out at 107.9, not 108.0.
+FM_BAND_LIMITS = {
+    0: (87.5, 108.0),
+    1: (76.0, 108.0),
+    2: (76.0, 90.0),
+    3: (64.0, 76.0),
+}
+
+FM_BAND_LIST = [
+    "87.5 - 107.9 MHz (Europe / US)",
+    "76.0 - 107.9 MHz (Japan wide)",
+    "76.0 - 89.9 MHz (Japan)",
+    "64.0 - 75.9 MHz (OIRT)",
+]
+
+FM_TUNING_MODE_LIST = ["Frequency (VFO)", "Channel (MR)"]
+
+# Widest range any band can reach, used when validating stored channels. A
+# channel is kept as long as *some* band could tune it: validating against only
+# the currently selected band would silently erase a perfectly good channel list
+# the moment someone switched bands, and CHIRP gives no ordering guarantee
+# between the band setting and the channel settings inside one set_settings().
+FMMIN = min(lo for lo, hi in FM_BAND_LIMITS.values())
+FMMAX = max(hi for lo, hi in FM_BAND_LIMITS.values())
 
 # bands supported by the UV-K5
 BANDS_STANDARD = {
@@ -1031,6 +1112,52 @@ def _resetradio(serport):
     _send_command(serport, resetpacket)
 
 
+def _check_upload_target(serport, firmware):
+    """Refuse to program a radio this module does not understand.
+
+    Two gates, both hard. Download and upload are independent operations, so
+    the module cannot assume the radio in front of it is the one the image came
+    from - it has to ask, before the first write.
+    """
+    # 1. Right firmware family? The handshake string is AUTHOR_STRING_2 plus
+    #    VERSION_STRING_2 from the firmware's version.c. Our tree sets
+    #    AUTHOR_STRING_2 to NR7Y; armel's Fusion sets it to F4HWN. Locally
+    #    built firmware reports a bare "NR7Y " because only the release
+    #    workflow injects a tag, so match on the prefix alone.
+    if not (firmware or "").startswith("NR7Y"):
+        raise errors.RadioError(
+            "This module only programs NR7Y CW firmware.\n"
+            "Radio reports: %s" % (firmware or "(no version string)"))
+
+    # 2. Right EEPROM schema? Block on anything but an exact match. Reading it
+    #    from the radio depends on eeprom_compat.c mapping through 0xA171 -
+    #    without that the address is unmapped and reads back 0xFF.
+    # Read 8 bytes, not 1. do_download proves hello-then-readmem is safe at the
+    # 0x80 block size it uses, but a 1-byte read is an unusual size this
+    # protocol is never otherwise asked for, and a 1-byte probe is what the
+    # removed detect_from_serial() was doing when downloads stopped working.
+    # Stay on a size the firmware handles routinely.
+    rep = _readmem(serport, NR7Y_SCHEMA_ADDR, 8)
+    if not rep:
+        raise errors.RadioError("Could not read the EEPROM schema marker.")
+
+    schema = rep[0]
+    if schema == 0xFF:          # never written = pre-v1.4. Must come first:
+        schema = NR7Y_SCHEMA_LEGACY   # 0xFF > CURRENT would take the wrong branch.
+
+    if schema < NR7Y_SCHEMA_CURRENT:
+        raise errors.RadioError(
+            "This radio runs firmware older than v1.4 (EEPROM schema %d).\n"
+            "Update the firmware first - uploading now would corrupt CW and "
+            "SSB channel settings." % schema)
+
+    if schema > NR7Y_SCHEMA_CURRENT:
+        raise errors.RadioError(
+            "This radio uses EEPROM schema %d, newer than this module "
+            "understands (%d).\nUse the CHIRP module that shipped with the "
+            "radio's firmware release." % (schema, NR7Y_SCHEMA_CURRENT))
+
+
 def do_download(radio):
     """download eeprom from radio"""
     serport = radio.pipe
@@ -1048,6 +1175,7 @@ def do_download(radio):
     else:
         raise errors.RadioError("Failed to initialize radio")
 
+
     addr = 0
     while addr < MEM_SIZE:
         data = _readmem(serport, addr, MEM_BLOCK)
@@ -1059,6 +1187,16 @@ def do_download(radio):
             addr += MEM_BLOCK
         else:
             raise errors.RadioError("Memory download incomplete")
+
+    # Provenance travels with the image, so a saved .img can be checked with no
+    # radio attached. Mirrors what mainline uvk5.py stores for firmware. Read
+    # the schema from the bytes we just fetched rather than asking the radio
+    # again - on pre-v1.4 firmware the address is unmapped and reads 0xFF.
+    schema = eeprom[NR7Y_SCHEMA_ADDR] if len(eeprom) > NR7Y_SCHEMA_ADDR else 0xFF
+    if schema == 0xFF:
+        schema = NR7Y_SCHEMA_LEGACY
+
+    radio.metadata = {'nr7y_firmware': f, 'nr7y_schema': schema}
 
     return memmap.MemoryMapBytes(eeprom)
 
@@ -1080,10 +1218,13 @@ def do_upload(radio):
     radio.status_fn(status)
 
     f = _sayhello(serport)
-    if f:
-        radio.FIRMWARE_VERSION = f
-    else:
-        return False
+    if not f:
+        # sync_out() discards this function's return value, so returning False
+        # here would report success on a failed handshake.
+        raise errors.RadioError("Failed to initialize radio")
+    radio.FIRMWARE_VERSION = f
+
+    _check_upload_target(serport, f)
 
     while True:
         if step == 0:
@@ -1413,6 +1554,70 @@ class UVK5RadioEgzumer(chirp_common.CloneModeRadio):
         chirp_common.split_tone_decode(mem, (tx_tmode, tx_tone, tx_pol),
                                        (rx_tmode, rx_tone, rx_pol))
 
+    # ------------------------------------------------------------- image version
+
+    def _eeprom_version_string(self):
+        """Firmware version recorded in the image itself, or "" if absent.
+
+        The firmware stamps VERSION_STRING_2 into the EEPROM at boot (see
+        SETTINGS_InitEEPROM in settings.c), so unlike FIRMWARE_VERSION - which
+        is only set during a live download - this travels with a saved .img and
+        can be read with no radio attached.
+        """
+        try:
+            raw = str(self._memobj.version.version)
+        except Exception as exc:
+            LOG.warning("Cannot read the EEPROM version block: %s", exc)
+            return ""
+
+        # Erased flash reads back as 0xFF and the firmware zero-pads a short
+        # string, so stop at the first byte that is not printable ASCII.
+        out = []
+        for ch in raw:
+            if not (' ' <= ch <= '~'):
+                break
+            out.append(ch)
+        return ''.join(out).strip()
+
+    # ---------------------------------------------------------------- mode bits
+
+    def _nr7y_apply_mode(self, _mem_chan, memory):
+        """Write modulation and bandwidth for the memory's mode.
+
+        The mode string fixes the bandwidth bit only for FM and AM, where
+        FM/NFM and AM/NAM are the ordinary CHIRP convention. USB and CW have no
+        narrow mode string to carry it (chirp_common.MODES has NCW but no NUSB,
+        and using one without the other would be inconsistent), so their bit
+        comes from the Bandwidth extra and is never inferred.
+        """
+        mod, bw = _NR7Y_MODE_BITS.get(memory.mode, (0, 0))
+        _mem_chan.modulation = mod
+
+        if bw is None:
+            bw = 0
+            for setting in getattr(memory, 'extra', None) or []:
+                if setting.get_name() == "nr7y_bandwidth":
+                    try:
+                        bw = NR7Y_BANDWIDTH_LIST.index(str(setting.value))
+                    except ValueError:
+                        bw = 0
+                    break
+        _mem_chan.bandwidth = bw
+
+    def _nr7y_mem_chan(self, number):
+        """The raw channel or VFO record for a memory number, or None."""
+        if not isinstance(number, int):
+            return None
+        ch_num = number - 1
+        if ch_num < 0:
+            return None
+        if ch_num < MR_CHANNELS_MAX:
+            return self._memobj.channel[ch_num]
+        try:
+            return self._memobj.vfo_channel[ch_num - MR_CHANNELS_MAX]
+        except IndexError:
+            return None
+
     # Extract a high-level memory object from the low-level memory map
     # This is called to populate a memory in the UI
     def get_memory(self, number):
@@ -1521,25 +1726,25 @@ class UVK5RadioEgzumer(chirp_common.CloneModeRadio):
         # tone data
         self._get_tone(mem, _mem)
 
-        # mode
-        temp_modes = self.get_features().valid_modes
-        # Convert modulation and bandwidth to int (they may be bitDE objects)
+        # ---- NR7Y: mode by table, not by arithmetic ----------------------
+        # Upstream computed the mode index as modulation * 2 + bandwidth, which
+        # only works while every modulation has a narrow variant in valid_modes.
+        # It does not: CHIRP has no NUSB string (chirp_common.MODES has NCW but
+        # not NUSB), so the list is ragged and the stride runs off the end at
+        # index 5. An explicit table sidesteps it entirely, and lets the
+        # bandwidth bit stay meaningful for USB/CW instead of being pinned.
         modulation = int(_mem.modulation)
         bandwidth = int(_mem.bandwidth)
-        temp_modul = modulation * 2 + bandwidth
-        
-        if temp_modul < len(temp_modes):
-            mem.mode = temp_modes[temp_modul]
-        elif temp_modul == 5:  # USB with narrow setting
-            mem.mode = temp_modes[4]
-        elif temp_modul >= len(temp_modes):
-            # Invalid modulation (corrupt data), use FM as safe default
-            LOG.warning(f"Memory {mem.number}: Invalid modulation={modulation}, bandwidth={bandwidth}, "
-                       f"using FM as default")
-            mem.mode = "FM"  # Safe default instead of invalid string
-            # Also clean up the corrupt values
+
+        names = _NR7Y_MODE_NAME.get(modulation)
+        if names is None:
+            LOG.warning(f"Memory {mem.number}: Invalid modulation={modulation}, "
+                        f"bandwidth={bandwidth}, using FM as default")
+            mem.mode = "FM"
             _mem.modulation = 0
             _mem.bandwidth = 0
+        else:
+            mem.mode = names[bandwidth & 1]
 
         # tuning step
         tstep = int(_mem.step)
@@ -1909,17 +2114,50 @@ class UVK5RadioEgzumer(chirp_common.CloneModeRadio):
             elif elname == "set_menu_lock":
                 _mem.set_menu_lock = int(element.value)
 
-            # fm radio
+            # fm radio - receiver configuration (0x00A020)
+            if elname == "fm_band":
+                try:
+                    _mem.fm_band = FM_BAND_LIST.index(str(element.value))
+                except ValueError:
+                    _mem.fm_band = 0
+
+            elif elname == "fm_is_mr_mode":
+                _mem.fm_is_mr_mode = int(
+                    FM_TUNING_MODE_LIST.index(str(element.value)) == 1)
+
+            elif elname == "fm_selected_channel":
+                # Stored zero-based; the UI counts channels from 1.
+                _mem.fm_selected_channel = max(
+                    0, min(int(element.value) - 1, FM_CHANNELS_MAX - 1))
+
+            elif elname == "fm_selected_frequency":
+                band_lo, band_hi = FM_BAND_LIMITS[int(_mem.fm_band) & 0x03]
+                try:
+                    val2 = int(round(float(str(element.value).strip()) * 10))
+                except Exception:
+                    val2 = int(band_lo * 10)
+                # Upper bound is exclusive (lo <= freq < hi), matching the
+                # firmware. Out-of-band values fall back to the bottom of the
+                # band rather than to 0xFFFF: the firmware applies the same
+                # clamp on load, so writing garbage here would just be undone.
+                if val2 < band_lo * 10 or val2 >= band_hi * 10:
+                    val2 = int(band_lo * 10)
+                _mem.fm_selected_frequency = val2
+
+            # fm radio - channel memories (0x00A028)
             for i in range(1, FM_CHANNELS_MAX + 1):
                 freqname = "FM_" + str(i)
                 if elname == freqname:
                     val = str(element.value).strip()
                     try:
-                        val2 = int(float(val)*10)
+                        val2 = int(round(float(val)*10))
                     except Exception:
                         val2 = 0xffff
 
-                    if val2 < FMMIN*10 or val2 > FMMAX*10:
+                    # Validated against the widest band the BK1080 supports,
+                    # not the currently selected one - see FM_BAND_LIMITS.
+                    # Upper bound exclusive, as FM_CheckValidChannel() has it.
+                    if val2 < FMMIN*10 or val2 >= FMMAX*10:
                         val2 = 0xffff
 #                        raise errors.InvalidValueError(
 #                                "FM radio frequency should be a value "
@@ -2045,7 +2283,13 @@ class UVK5RadioEgzumer(chirp_common.CloneModeRadio):
         Compair1 = "F4HWN v5.0"  
 
         if self.FIRMWARE_VERSION == "":
-            ValFirm = "Firmware : Only when read from the radio "
+            # No live radio, but the image carries the version the firmware
+            # stamped into EEPROM, so report that rather than nothing.
+            _img_version = self._eeprom_version_string()
+            if _img_version:
+                ValFirm = "Firmware : " + _img_version + " (from image)"
+            else:
+                ValFirm = "Firmware : Only when read from the radio "
       
         else:
             FIRMWARE_VERSION_RADIO = self.FIRMWARE_VERSION
@@ -2851,18 +3095,78 @@ class UVK5RadioEgzumer(chirp_common.CloneModeRadio):
 
         # ----------------- FM radio
 
+        # How the radio gets into the FM broadcast receiver, and what the keys
+        # do once it is there. Repeated in each doc string below so it shows up
+        # wherever the user happens to be looking.
+        fm_entry_help = (
+            'To listen to FM broadcast: press F, then long-press the 0/FM key.\n'
+            'Press EXIT to leave FM and return to the radio.\n'
+            'While in FM: UP/DOWN change station or channel, * starts a scan,\n'
+            'and the MENU key toggles between frequency (VFO) and channel (MR)\n'
+            'tuning.')
+
+        # int() matters: list_def hands back the bitwise object untouched when
+        # the value is already in range, and that is not hashable.
+        tmpfmband = int(list_def(int(_mem.fm_band), FM_BAND_LIST, 0))
+        band_lo, band_hi = FM_BAND_LIMITS[tmpfmband]
+        val = RadioSettingValueList(FM_BAND_LIST, FM_BAND_LIST[tmpfmband])
+        rs = RadioSetting("fm_band", "Band", val)
+        rs.set_doc('Tuning range of the BK1080 FM broadcast receiver.\n'
+                   'Channels outside the selected band are stored but will be\n'
+                   'skipped by the radio, so pick the band before entering\n'
+                   'stations.\n\n' + fm_entry_help)
+        fmradio.append(rs)
+
+        val = RadioSettingValueList(
+            FM_TUNING_MODE_LIST,
+            FM_TUNING_MODE_LIST[1 if _mem.fm_is_mr_mode else 0])
+        rs = RadioSetting("fm_is_mr_mode", "Tuning mode", val)
+        rs.set_doc('Which mode the FM receiver starts in.\n'
+                   'Frequency (VFO) tunes continuously; Channel (MR) steps\n'
+                   'through the stored channels below. The MENU key toggles\n'
+                   'this on the radio.\n\n' + fm_entry_help)
+        fmradio.append(rs)
+
+        val = RadioSettingValueInteger(
+            1, FM_CHANNELS_MAX,
+            min(int(_mem.fm_selected_channel) + 1, FM_CHANNELS_MAX))
+        rs = RadioSetting("fm_selected_channel", "Selected channel (MR)", val)
+        rs.set_doc('Channel the FM receiver returns to in Channel (MR) mode.\n'
+                   'If that channel is empty the radio moves to the next\n'
+                   'programmed one.\n\n' + fm_entry_help)
+        fmradio.append(rs)
+
+        tmpfmsel = int(_mem.fm_selected_frequency) / 10.0
+        if tmpfmsel < band_lo or tmpfmsel >= band_hi:
+            tmpfmsel = band_lo
+        val = RadioSettingValueString(0, 5, ("%.1f" % tmpfmsel))
+        rs = RadioSetting("fm_selected_frequency",
+                          "Selected frequency (VFO)", val)
+        rs.set_doc('Station the FM receiver returns to in Frequency (VFO)\n'
+                   'mode, in MHz. Must be inside the selected band\n'
+                   '(%.1f - %.1f MHz); out-of-range values are pulled back to\n'
+                   'the bottom of the band.\n\n%s'
+                   % (band_lo, band_hi - 0.1, fm_entry_help))
+        fmradio.append(rs)
+
         append_label(fmradio, "Channel Memory Radio (MR)", "Frequency (MHz)")
 
         for i in range(1, FM_CHANNELS_MAX + 1):
-            fmfreq = _mem.fmfreq[i-1]/10.0
+            fmfreq = int(_mem.fmfreq[i-1])/10.0
             freq_name = str(fmfreq)
-            if fmfreq < FMMIN or fmfreq > FMMAX:
+            # Upper bound is exclusive, matching FM_CheckValidChannel() in the
+            # firmware (lo <= freq < hi).
+            if fmfreq < FMMIN or fmfreq >= FMMAX:
                 freq_name = ""
             rs = RadioSetting("FM_" + str(i), "Ch " + str(i),
                               RadioSettingValueString(0, 5, freq_name))
-            rs.set_doc('FM Broadcast frequency: Enter the frequency in MHz, example: 96.9\n' + \
-                       'To listen the FM Broadcast band, Long press the 5 key, then if you want to scan for\n' + \
-                       'stations around, press *. Scan result will erase the existing FM broadcast list.')
+            rs.set_doc('FM Broadcast frequency in MHz, for example: 96.9\n'
+                       'Leave blank to erase the channel. Values outside\n'
+                       '%.1f - %.1f MHz are erased; values outside the selected\n'
+                       'band (%.1f - %.1f MHz) are kept but skipped by the radio.\n\n'
+                       'Scanning with * on the radio overwrites this whole list.\n\n%s'
+                       % (FMMIN, FMMAX - 0.1, band_lo, band_hi - 0.1,
+                          fm_entry_help))
             fmradio.append(rs)
 
         # ----------------- Unlock settings
@@ -2888,8 +3192,12 @@ class UVK5RadioEgzumer(chirp_common.CloneModeRadio):
         # ----------------- Driver Info
 
         if self.FIRMWARE_VERSION == "":
-            firmware = "To get the firmware version please download " \
-                       "the image from the radio first"
+            _img_version = self._eeprom_version_string()
+            if _img_version:
+                firmware = "%s  (recorded in this image, not read live)" % _img_version
+            else:
+                firmware = "To get the firmware version please download " \
+                           "the image from the radio first"
         else:
             firmware = self.FIRMWARE_VERSION
 
@@ -3180,6 +3488,8 @@ class UVK5RadioEgzumer(chirp_common.CloneModeRadio):
         append_label(help_group,"(Lx) = Low TX power, with x = level 1 to 5" , "Under each VFO" )
         append_label(help_group,"(W) = Wide BF filter: 12.5kHz (WIDE)" , "Under each VFO" )
         append_label(help_group,"(N) = Narrow BF filter: 6.25kHz (NARROW)" , "Under each VFO" )
+        append_label(help_group,"(6k) = Wide filter on a CW or USB channel" , "Under each VFO, replaces W/N" )
+        append_label(help_group,"(2k) = Narrow filter on a CW or USB channel" , "Under each VFO, replaces W/N" )
 
         append_label(help_group,"" , "" )
 
@@ -3226,6 +3536,7 @@ class UVK5RadioEgzumer(chirp_common.CloneModeRadio):
 
         append_label(help_group,"","" )
         append_label(help_group,"(4 FC) = long press: start the CTCSS & frequency scan " , "Same as long press " )
+        append_label(help_group,"(4 FC) = F then LONG press: toggle the RX filter bandwidth of the active VFO " , "FM/AM show W/N, CW & USB show 6k/2k " )
         append_label(help_group,"(4 FC) = short press: digit 4  "," " )
 
 
@@ -3233,6 +3544,7 @@ class UVK5RadioEgzumer(chirp_common.CloneModeRadio):
         
         append_label(help_group,"(5 NOAA) = long press: if in VFO mode: display ScnRnG " , "Display fagci spectrum analyze " )
         append_label(help_group,"(5 NOAA) = long press: if in memory mode,  change the scan list " , " ")
+        append_label(help_group,"(5 NOAA) = F then LONG press: Code Practice Oscillator (CPO) " , "CW practice with sidetone only, no RF. EXIT leaves it " )
         append_label(help_group,"(5 NOAA) = short press: digit 5  "," " )
 
         append_label(help_group,"","" )
@@ -3242,12 +3554,14 @@ class UVK5RadioEgzumer(chirp_common.CloneModeRadio):
 
         append_label(help_group,"","" )
                 
-        append_label(help_group,"(0 FM) = long press: FM Broadcast listening ", "Same as long press " )
+        append_label(help_group,"(0 FM) = long press: rotate the reception mode (FM/AM/USB/CW) of the active VFO ", "Same as long press " )
+        append_label(help_group,"(0 FM) = F then LONG press: FM Broadcast listening ", "EXIT leaves FM radio " )
         append_label(help_group,"(0 FM) = short press: digit 0  "," " )
 
         append_label(help_group,"","")
         
-        append_label(help_group,"(7 VOX) = long press: change voice Activation (VX) " , "Same as long press " )
+        append_label(help_group,"(7 VOX) = long press: on a CW channel, toggle break-in (BKIN) on/off " , "Break-in keys the transmitter straight from the paddle " )
+        append_label(help_group,"(7 VOX) = long press: on any other channel, change voice Activation (VX) " , "Same as long press " )
         append_label(help_group,"(7 VOX) = short press: digit 7  "," " )
 
         append_label(help_group,"","" )
@@ -3474,12 +3788,12 @@ class UVK5RadioEgzumer(chirp_common.CloneModeRadio):
         # find band
         band = self._find_band(memory.freq)
 
-        # mode
-        tmp_mode = self.get_features().valid_modes.index(memory.mode)
-        _mem_chan.modulation = tmp_mode / 2
-        _mem_chan.bandwidth = tmp_mode % 2
-        if memory.mode == "USB":
-            _mem_chan.bandwidth = 1  # narrow
+        # ---- NR7Y: mode by table, and never pin the bandwidth bit --------
+        # Upstream forced bandwidth = 1 for USB, which made the bit unusable as
+        # a filter selector. Under EEPROM schema 2 that bit is the user's choice
+        # (wide = 6.25k, narrow = 2.0k on CW/SSB), so USB and CW take it from
+        # the Bandwidth extra instead - see _nr7y_apply_mode().
+        self._nr7y_apply_mode(_mem_chan, memory)
 
         # frequency/offset
         _mem_chan.freq = memory.freq/10
@@ -3578,105 +3892,138 @@ class UVK5_NR7Y_Fusion(UVK5RadioEgzumer):
     # ------------------------------------------------------------------ memory
 
     def get_memory(self, number):
-        # The base class decodes mode from raw modulation*2 + bandwidth,
-        # sized for exactly the 5 combinations of FM/NFM/AM/NAM/USB.
-        # Appending "CW" to valid_modes (6 entries) shifted that table's
-        # bounds check, so two raw values now decode wrong straight out of
-        # the base class:
-        #   - USB narrow (modulation=2, bandwidth=1 - what set_memory always
-        #     writes for USB) computes to index 5, which used to fall
-        #     through to the "USB narrow" special case but now lands
-        #     directly on the new 6th list entry, "CW".
-        #   - CW itself (modulation=3) computes to index 6 or 7, always out
-        #     of range, which the base class treats as *corrupt* data - it
-        #     not only reports "FM" but destructively zeroes
-        #     modulation/bandwidth on the live memmap object, so merely
-        #     displaying a CW channel silently erased its CW-ness before
-        #     this override ever got a chance to run.
-        # Fix both by presenting the base class a substitute raw value it
-        # always decodes correctly, then restoring the true bits (and the
-        # true mode) immediately after - nothing outside this call ever sees
-        # the substitute.
-        is_cw = False
-        is_usb_narrow = False
-        raw_mod = raw_bw = 0
-
-        _mem_chan = None
-        if isinstance(number, int):
-            ch_num = number - 1
-            if ch_num < MR_CHANNELS_MAX:
-                _mem_chan = self._memobj.channel[ch_num]
-            else:
-                _mem_chan = self._memobj.vfo_channel[ch_num - MR_CHANNELS_MAX]
-
-        if _mem_chan is not None:
-            raw_mod = int(_mem_chan.modulation)
-            raw_bw = int(_mem_chan.bandwidth)
-            is_cw = (raw_mod == 3)          # MODULATION_CW
-            is_usb_narrow = (raw_mod == 2 and raw_bw == 1)   # MODULATION_USB, narrow
-
-            if is_cw:
-                _mem_chan.modulation = 0
-                _mem_chan.bandwidth = 0
-            elif is_usb_narrow:
-                _mem_chan.bandwidth = 0
-
         mem = super().get_memory(number)
 
-        if _mem_chan is not None:
-            if is_cw:
-                _mem_chan.modulation = raw_mod
-                _mem_chan.bandwidth = raw_bw
-                if not getattr(mem, 'empty', False):
-                    mem.mode = "CW"
-            elif is_usb_narrow:
-                _mem_chan.bandwidth = raw_bw
+        _mem_chan = self._nr7y_mem_chan(number)
+        if _mem_chan is None or getattr(mem, 'empty', False):
+            return mem
 
-            # For CW/USB channels, firmware reuses the TXLock bit to select
-            # the 2.0kHz "narrowest" RF filter instead (TX_LOCK can never be
-            # true for these modes - RADIO_ConfigureChannel forces it off).
-            # The base class built an Extra "txLock" setting labeled as a TX
-            # lock regardless of mode; relabel it here to match what the bit
-            # actually does for CW/USB, without changing its internal name -
-            # set_memory's existing "txLock" write-back path still applies.
-            if (raw_mod in (2, 3) and self._is_nr7y_cw_firmware()
-                    and not getattr(mem, 'empty', False)):
-                new_extra = RadioSettingGroup("Extra", "extra")
-                for rs in mem.extra:
-                    if rs.get_name() == "txLock":
-                        enc = list_def(int(rs.value), NR7Y_CW_SSB_BANDWIDTH_LIST, 0)
-                        rs = RadioSetting(
-                            "txLock", "Bandwidth (CW/SSB)",
-                            RadioSettingValueList(NR7Y_CW_SSB_BANDWIDTH_LIST, None, enc))
-                        rs.set_doc(
-                            'On CW/SSB channels this bit selects the extra-narrow '
-                            '2.0kHz RF filter instead of TX Lock, which does not '
-                            'apply to these modes.\n'
-                            '* NARROW: normal CW/SSB filter\n'
-                            '* NARROWEST: extra-narrow 2.0kHz filter')
-                    new_extra.append(rs)
-                mem.extra = new_extra
+        # On CW and SSB the bandwidth bit is not carried by the mode string, so
+        # surface it as its own setting. Plain Wide/Narrow: the firmware decides
+        # that means 6.25k or 2.0k on these modes, and naming the widths here
+        # would only invite confusion with the FM ones.
+        if int(_mem_chan.modulation) in (2, 3) and self._is_nr7y_cw_firmware():
+            enc = list_def(int(_mem_chan.bandwidth), NR7Y_BANDWIDTH_LIST, 0)
+            rs = RadioSetting(
+                "nr7y_bandwidth", "Bandwidth",
+                RadioSettingValueList(NR7Y_BANDWIDTH_LIST, None, enc))
+            rs.set_doc(
+                'Receive filter for this CW/SSB channel.\n'
+                '* Wide: 6.25 kHz\n'
+                '* Narrow: 2.0 kHz')
+            if mem.extra is None:
+                mem.extra = RadioSettingGroup("Extra", "extra")
+            mem.extra.append(rs)
 
         return mem
 
-    def set_memory(self, memory):
-        if memory.mode == "CW" and not getattr(memory, 'empty', False):
-            # Temporarily use FM so the base class does not misinterpret CW
-            # as USB (index 5 in valid_modes → modulation=2, bandwidth=1).
-            memory.mode = "FM"
-            super().set_memory(memory)
-            memory.mode = "CW"   # restore caller's object
-            number = memory.number - 1
-            if isinstance(number, int):
-                if number < MR_CHANNELS_MAX:
-                    self._memobj.channel[number].modulation = 3  # MODULATION_CW
-                    self._memobj.channel[number].bandwidth = 0
-                else:
-                    vfo_idx = number - MR_CHANNELS_MAX
-                    self._memobj.vfo_channel[vfo_idx].modulation = 3
-                    self._memobj.vfo_channel[vfo_idx].bandwidth = 0
-        else:
-            super().set_memory(memory)
+    # ------------------------------------------------------------------ schema
+
+    @classmethod
+    def nr7y_approve_schema(cls, schema):
+        """True if this module understands that EEPROM layout.
+
+        Schema 1 is accepted because it is upgraded in memory on load; anything
+        past 2 was written by a newer firmware and belongs to a newer module.
+        """
+        return schema <= NR7Y_SCHEMA_CURRENT
+
+    # NOTE: no detect_from_serial(), and no detected_by() sub-model either.
+    # These two go together: CloneModeRadio.detect_from_serial() asserts that a
+    # class with detected models implements its own, so registering one without
+    # the other makes every clone fail with "Internal driver error" before the
+    # port is even touched (chirp_common.py, detect_from_serial).
+    #
+    #
+    # An earlier version probed the schema byte over the wire before the
+    # download so a newer-schema radio could be routed to NR7YRestrictedRadio.
+    # It broke downloads outright: clone.py runs detection on the open port
+    # before do_download, and the extra hello/readmem exchange left the radio
+    # not answering at all - every download died with "Header short read".
+    # The firmware drops any command whose timestamp does not match the last
+    # hello (uart.c CMD_051B) and answers nothing, which is exactly that
+    # symptom.
+    #
+    # It bought nothing today: no schema past 2 exists, so detection could only
+    # ever return this class anyway. The download path is now byte-for-byte the
+    # same conversation the working v1.3 module has. When a schema 3 does exist,
+    # wire demotion up then - and test it on hardware first.
+
+    def _nr7y_read_schema(self):
+        """Schema of the loaded image, normalised. 0xFF means pre-v1.4."""
+        try:
+            schema = int(self._memobj.schema)
+        except Exception as exc:
+            LOG.warning("Cannot read EEPROM schema marker: %s", exc)
+            return NR7Y_SCHEMA_LEGACY
+        # Normalise erased flash first: 0xFF is 255, so comparing it before
+        # this would take the "newer schema" branch.
+        if schema == 0xFF:
+            return NR7Y_SCHEMA_LEGACY
+        return schema
+
+    def _nr7y_upgrade_schema(self):
+        """Bring a schema 1 image up to schema 2, in memory.
+
+        Same mapping the firmware applies on first boot: on CW and USB records
+        the old NARROWEST flag in bit 6 becomes the filter bit, and bit 6 goes
+        back to being TX_LOCK, set on. Schema 1 is read-only - this module
+        never writes it back.
+        """
+        migrated = 0
+
+        for record in list(self._memobj.channel) + list(self._memobj.vfo_channel):
+            try:
+                mod = int(record.modulation)
+            except Exception:
+                continue
+            # An erased record decodes to modulation 0xF and matches neither.
+            if mod not in (2, 3):
+                continue
+
+            was_narrowest = int(record.txLock) & 1
+            record.bandwidth = was_narrowest
+            record.txLock = 1
+            migrated += 1
+
+        self._memobj.schema = NR7Y_SCHEMA_CURRENT
+        self.metadata = {'nr7y_schema': NR7Y_SCHEMA_CURRENT}
+
+        LOG.warning(
+            'Image used EEPROM schema %d and has been upgraded to schema %d '
+            '(%d CW/SSB channels). Saving this file will store it in the new '
+            'layout, which pre-v1.4 firmware cannot read.',
+            NR7Y_SCHEMA_LEGACY, NR7Y_SCHEMA_CURRENT, migrated)
+
+    def _check_schema_at_load(self):
+        """Gate an image the way mainline uvk5.py gates firmware at load.
+
+        Missing provenance is a warning, not a failure - an image written by an
+        older or modified module simply has nothing to check. A schema that is
+        present and unsupported raises.
+        """
+        if 'nr7y_schema' not in self.metadata:
+            # The EEPROM version block is still there even when the module's
+            # own metadata is not, which is exactly the case this warns about.
+            img_version = self._eeprom_version_string()
+            LOG.warning('This image has no EEPROM schema information%s. It may '
+                        'have been generated with an old or modified version '
+                        'of this module. Download a fresh image from your '
+                        'radio for the best safety and compatibility.',
+                        ' (firmware reports %s)' % img_version
+                        if img_version else '')
+
+        schema = self._nr7y_read_schema()
+        if not self.nr7y_approve_schema(schema):
+            raise errors.RadioError(
+                'Image uses EEPROM schema %d, which is not supported by this '
+                'module' % schema)
+
+    def process_mmap(self):
+        super().process_mmap()
+        self._check_schema_at_load()
+        if self._nr7y_read_schema() < NR7Y_SCHEMA_CURRENT:
+            self._nr7y_upgrade_schema()
 
     # ------------------------------------------------------------------ key actions helper
 
