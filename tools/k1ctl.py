@@ -23,6 +23,13 @@ MODES = {
     "USB": 2,
     "CW": 3,
 }
+MODE_NAMES = {value: name for name, value in MODES.items()}
+
+BANDWIDTHS = {
+    "WIDE": 0,
+    "NARROW": 1,
+}
+BW_NAMES = {value: name for name, value in BANDWIDTHS.items()}
 
 STATUS = {
     0: "ok",
@@ -30,6 +37,7 @@ STATUS = {
     2: "frequency out of band",
     3: "radio is transmitting",
     4: "modulation not built into this firmware",
+    5: "bad bandwidth",
 }
 
 
@@ -54,8 +62,12 @@ def frame(payload: bytes) -> bytes:
     return b"\xAB\xCD" + length + mixed + mixed_crc + b"\xDC\xBA"
 
 
-def set_vfo(vfo: int, hz: int, modulation: int) -> bytes:
-    body = bytes([vfo]) + hz.to_bytes(4, "little") + bytes([modulation & 0xFF])
+def set_vfo(vfo: int, hz: int, modulation: int, bandwidth: int) -> bytes:
+    body = (
+        bytes([vfo])
+        + hz.to_bytes(4, "little")
+        + bytes([modulation & 0xFF, bandwidth & 0xFF])
+    )
     payload = (0x0531).to_bytes(2, "little") + len(body).to_bytes(2, "little") + body
     return frame(payload)
 
@@ -78,7 +90,9 @@ def parse_reply(raw: bytes):
     status = payload[4]
     vfo = payload[5]
     hz = int.from_bytes(payload[6:10], "little")
-    return status, vfo, hz
+    modulation = payload[10] if len(payload) >= 12 else None
+    bandwidth = payload[11] if len(payload) >= 12 else None
+    return status, vfo, hz, modulation, bandwidth
 
 
 def main() -> int:
@@ -87,17 +101,24 @@ def main() -> int:
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--vfo", type=int, choices=(0, 1), default=0)
     ap.add_argument("--mod", choices=tuple(MODES), default=None,
-                    help="omit to keep the current modulation")
-    ap.add_argument("mhz", help="frequency in MHz, e.g. 145.5")
+                    help="FM, AM, USB, or CW; omit to keep the current mode")
+    ap.add_argument("--bw", choices=tuple(BANDWIDTHS), default=None,
+                    help="WIDE or NARROW; omit to keep the current bandwidth")
+    ap.add_argument("mhz", nargs="?", help="frequency in MHz, e.g. 145.5; omit to keep it")
     args = ap.parse_args()
+
+    if args.mhz is None and args.mod is None and args.bw is None:
+        ap.error("give a frequency, --mod, or --bw")
 
     if serial is None:
         sys.exit("pyserial is missing. Create the virtual environment described in README.md")
 
     # Radio frequency unit is 10 Hz (145.5 MHz -> 14550000), same as the keypad.
-    hz = int(round(float(args.mhz) * 100_000))
+    # 0xFFFFFFFF tells the radio to leave the current frequency alone.
+    hz = 0xFFFFFFFF if args.mhz is None else int(round(float(args.mhz) * 100_000))
     mod = 0xFF if args.mod is None else MODES[args.mod]
-    packet = set_vfo(args.vfo, hz, mod)
+    bw = 0xFF if args.bw is None else BANDWIDTHS[args.bw]
+    packet = set_vfo(args.vfo, hz, mod, bw)
 
     with serial.Serial(args.port, args.baud, timeout=1) as ser:
         ser.write(packet)
@@ -105,8 +126,10 @@ def main() -> int:
 
     if reply is None:
         sys.exit("no 0x0532 reply (flash a firmware that includes the live VFO command)")
-    status, vfo, applied = reply
-    print(f"VFO {vfo}  {applied / 100_000:.5f} MHz  {STATUS.get(status, status)}")
+    status, vfo, applied, modulation, bandwidth = reply
+    mode = MODE_NAMES.get(modulation, "?" if modulation is None else str(modulation))
+    width = BW_NAMES.get(bandwidth, "?" if bandwidth is None else str(bandwidth))
+    print(f"VFO {vfo}  {applied / 100_000:.5f} MHz  {mode}  {width}  {STATUS.get(status, status)}")
     return 0 if status == 0 else 1
 
 

@@ -555,10 +555,11 @@ source .venv/bin/activate
 python -m pip install -r tools/requirements.txt
 
 python tools/k1ctl.py --port /dev/cu.usbmodemXXXX 145.5
-python tools/k1ctl.py --port /dev/cu.usbmodemXXXX --vfo 1 --mod AM 433.5
+python tools/k1ctl.py --port /dev/cu.usbmodemXXXX --vfo 1 --mod AM --bw NARROW 433.5
+python tools/k1ctl.py --port /dev/cu.usbmodemXXXX --mod CW --bw WIDE
 ```
 
-On Windows, activate with `.venv\Scripts\activate`. USB CDC ignores the baud rate. Omit `--mod` to keep the current modulation. `--mod CW` is accepted only by a firmware build that includes CW.
+On Windows, activate with `.venv\Scripts\activate`. USB CDC ignores the baud rate. Omit the frequency to keep it, omit `--mod` to keep the mode, and omit `--bw` to keep wide or narrow. `--mod` is `FM`, `AM`, `USB`, or `CW`. `--mod CW` is accepted only by a firmware build that includes CW. `--bw` is `WIDE` or `NARROW`. On FM that is 25 kHz or 12.5 kHz. On CW and USB, when the extra filter is built in, wide is 6.25 kHz and narrow is 2 kHz.
 
 ## Flashing the Firmware with UV Studio
 
