@@ -853,44 +853,39 @@ void UI_DisplayAudioBar(void)
 #endif
 
 #ifdef ENABLE_CW_MODULATOR
-/* Marquee for the CW decode center line (1 px / 100 ms while the bar is visible). */
-static uint16_t sCwMarqueeOffsetPx;
-static uint8_t  sCwMarqueeTick10ms;
-static uint8_t  sCwMarqueeLastLen;
-
+/* Kept so the 10 ms tick still has a call site. The decode line no longer
+ * walks the string across the screen; see DrawCWDecodeBar. */
 void UI_MAIN_CWDecodeMarqueeTimeSlice10ms(void)
 {
-	const bool visible = (gCW_TX_Display[0] != 0)
-		&& (gCurrentFunction == FUNCTION_TRANSMIT
-			|| gCW_TxDisplayHoldoff_10ms > 0);
-
-	if (!visible) {
-		sCwMarqueeTick10ms = 0;
-		return;
-	}
-
-	if (++sCwMarqueeTick10ms >= 10) {
-		sCwMarqueeTick10ms = 0;
-		sCwMarqueeOffsetPx++;
-		gUpdateDisplay = true;
-	}
+	/* Decode text is drawn in place. This tick used to scroll it. */
 }
 
-/* Draw small-font text clipped to [clipL, clipR). Start may be off-screen. */
-static void UI_MAIN_PrintSmallClipped(const char *text, int startX, unsigned int line,
-                                      unsigned int clipL, unsigned int clipR)
+/* Small font, one column at a time, so a glyph can sit partly off the zone
+ * without being dropped. Matches UI_PrintStringBuffer's 1 px left pad. */
+static void UI_MAIN_BlitSmallClipped(const char *text, int startX, uint8_t *line,
+                                     unsigned int clipL, unsigned int clipR)
 {
 	const unsigned int pitch = FONT_SMALL_WIDTH + 1u;
 
 	for (unsigned int i = 0; text[i] != '\0'; i++) {
-		const int cx = startX + (int)(i * pitch);
-		if (cx + (int)pitch <= (int)clipL || cx >= (int)clipR)
+		const int cell = startX + (int)(i * pitch);
+		if (cell + (int)pitch <= (int)clipL || cell >= (int)clipR)
 			continue;
-		if (cx < (int)clipL || cx + (int)pitch > (int)clipR)
-			continue; /* skip partially clipped glyphs */
+		if (text[i] <= ' ' || text[i] >= 127)
+			continue;
 
-		char tmp[2] = { text[i], '\0' };
-		UI_PrintStringSmallNormal(tmp, (uint8_t)cx, 0, (uint8_t)line);
+		const unsigned int index = (unsigned int)(text[i] - ' ' - 1);
+		uint16_t bit = (uint16_t)(index * FONT_SMALL_WIDTH * 7u);
+
+		for (uint8_t column = 0; column < FONT_SMALL_WIDTH; column++) {
+			const int x = cell + 1 + (int)column;
+			const uint16_t byte = bit >> 3;
+			const uint16_t packed = gFontSmallPacked[byte] | ((uint16_t)gFontSmallPacked[byte + 1u] << 8);
+
+			if (x >= (int)clipL && x < (int)clipR)
+				line[x] = (uint8_t)((packed >> (bit & 7u)) & 0x7Fu);
+			bit = (uint16_t)(bit + 7u);
+		}
 	}
 }
 
@@ -905,7 +900,6 @@ void DrawCWDecodeBar(void)
 	uint8_t *p_line = gFrameBuffer[line];
 	char String[CW_TX_DISPLAY_SIZE];
 	const unsigned int textLeft = sizeof(BITMAP_Play) + 2u; /* play glyph + gap */
-	const unsigned int pitch = FONT_SMALL_WIDTH + 1u;
 	const unsigned int zoneW = LCD_WIDTH - textLeft;
 
 	if (gScreenToDisplay != DISPLAY_MAIN)
@@ -914,20 +908,15 @@ void DrawCWDecodeBar(void)
 	memset(p_line, 0, LCD_WIDTH);
 
 	const uint8_t len = CW_GetTxDisplayTail(String, sizeof(String));
-	if (len != sCwMarqueeLastLen) {
-		/* New character: re-anchor at the right edge of the zone. */
-		sCwMarqueeLastLen = len;
-		sCwMarqueeOffsetPx = 0;
-	}
 
-	if (len > 0 && zoneW > pitch) {
+	if (len > 0 && zoneW > 0) {
+		const unsigned int pitch = FONT_SMALL_WIDTH + 1u;
 		const unsigned int textW = len * pitch;
-		/* Enter from the right, scroll left across the full zone, then wrap. */
-		const unsigned int period = textW + zoneW;
-		const unsigned int phase = (period > 0) ? (sCwMarqueeOffsetPx % period) : 0;
-		const int startX = (int)(textLeft + zoneW) - (int)phase;
+		/* Fits: hold still at the left. Wider: keep the characters just
+		 * decoded on screen and clip the older ones off the left. */
+		const unsigned int offset = (textW > zoneW) ? (textW - zoneW) : 0u;
 
-		UI_MAIN_PrintSmallClipped(String, startX, line, textLeft, LCD_WIDTH);
+		UI_MAIN_BlitSmallClipped(String, (int)textLeft - (int)offset, p_line, textLeft, LCD_WIDTH);
 	}
 
 	if (gCW_PlaybackActive && (center_line == CENTER_LINE_NONE || center_line == CENTER_LINE_CW_DECODE)) {
