@@ -72,6 +72,38 @@ def set_vfo(vfo: int, hz: int, modulation: int, bandwidth: int) -> bytes:
     return frame(payload)
 
 
+def send_morse(text: str) -> bytes:
+    body = text.encode("ascii")
+    payload = (0x0533).to_bytes(2, "little") + len(body).to_bytes(2, "little") + body
+    return frame(payload)
+
+
+def parse_morse_reply(raw: bytes):
+    start = raw.find(b"\xAB\xCD")
+    if start < 0 or len(raw) < start + 8:
+        return None
+    size = int.from_bytes(raw[start + 2:start + 4], "little")
+    end = start + 4 + size + 2
+    if len(raw) < end + 2 or raw[end:end + 2] != b"\xDC\xBA":
+        return None
+    mixed = raw[start + 4:end]
+    plain = bytes(b ^ OBF[i % 16] for i, b in enumerate(mixed))
+    payload, crc_got = plain[:-2], int.from_bytes(plain[-2:], "little")
+    if crc16(payload) != crc_got:
+        raise SystemExit("reply CRC mismatch")
+    if int.from_bytes(payload[:2], "little") != 0x0534 or len(payload) < 6:
+        return None
+    return payload[4], payload[5]
+
+
+SEND_STATUS = {
+    0: "sending",
+    1: "VFO is not in CW mode",
+    2: "empty or too long",
+    3: "radio is already sending",
+}
+
+
 def parse_reply(raw: bytes):
     start = raw.find(b"\xAB\xCD")
     if start < 0 or len(raw) < start + 8:
@@ -104,14 +136,31 @@ def main() -> int:
                     help="FM, AM, USB, or CW; omit to keep the current mode")
     ap.add_argument("--bw", choices=tuple(BANDWIDTHS), default=None,
                     help="WIDE or NARROW; omit to keep the current bandwidth")
+    ap.add_argument("--send", metavar="TEXT",
+                    help="key this text as Morse; the VFO must already be in CW")
     ap.add_argument("mhz", nargs="?", help="frequency in MHz, e.g. 145.5; omit to keep it")
     args = ap.parse_args()
 
-    if args.mhz is None and args.mod is None and args.bw is None:
-        ap.error("give a frequency, --mod, or --bw")
+    if args.send is None and args.mhz is None and args.mod is None and args.bw is None:
+        ap.error("give a frequency, --mod, --bw, or --send")
 
     if serial is None:
         sys.exit("pyserial is missing. Create the virtual environment described in README.md")
+
+    if args.send is not None:
+        try:
+            args.send.encode("ascii")
+        except UnicodeEncodeError:
+            sys.exit("Morse text must be ASCII")
+        packet = send_morse(args.send)
+        with serial.Serial(args.port, args.baud, timeout=1) as ser:
+            ser.write(packet)
+            reply = parse_morse_reply(ser.read(64))
+        if reply is None:
+            sys.exit("no 0x0534 reply (flash the CW firmware that includes Morse send)")
+        status, length = reply
+        print(f"{SEND_STATUS.get(status, status)}  {length} characters")
+        return 0 if status == 0 else 1
 
     # Radio frequency unit is 10 Hz (145.5 MHz -> 14550000), same as the keypad.
     # 0xFFFFFFFF tells the radio to leave the current frequency alone.

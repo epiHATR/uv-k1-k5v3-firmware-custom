@@ -56,6 +56,10 @@ bool CW_CheckKeyerInputs(uint8_t new_mode);
 // If repeat is true, playback will restart after CW_MESSAGE_REPEAT_DELAY expires.
 void CW_StartMacroPlayback(uint8_t macroIndex, bool repeat);
 
+/* Key the text as Morse through the macro player.
+ * 0 started, 1 VFO is not CW, 2 empty or too long, 3 already busy. */
+uint8_t CW_StartTextPlayback(const char *text, uint8_t length);
+
 // Stop playback and cancel any pending repeat
 void CW_StopPlayback(void);
 

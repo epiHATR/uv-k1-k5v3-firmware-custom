@@ -47,6 +47,9 @@
 #include "misc.h"
 #include "radio.h"
 #include "settings.h"
+#ifdef ENABLE_CW_MODULATOR
+#include "app/cwkeyer.h"
+#endif
 #include "version.h"
 
 #ifdef ENABLE_FEAT_F4HWN_MULTIBOOT
@@ -995,6 +998,41 @@ static void CMD_0531_SetVfo(uint32_t Port, const uint8_t *pBuffer)
     SendReply(Port, &Reply, sizeof(Reply));
 }
 
+/* Send Morse for a text body. CW builds key it through the macro player.
+ * Other presets reply status 1. Reply 0x0534: status, accepted length.
+ * 0 started, 1 not CW, 2 empty or too long, 3 already sending. */
+static void CMD_0533_SendMorse(uint32_t Port, const uint8_t *pBuffer)
+{
+    const Header_t *header = (const Header_t *)pBuffer;
+    struct __attribute__((packed)) {
+        Header_t Header;
+        uint8_t  Status;
+        uint8_t  Length;
+    } Reply;
+
+    uint8_t status = 1;
+    uint8_t length = 0;
+
+#ifdef ENABLE_CW_MODULATOR
+    if (header->Size == 0u || header->Size >= 93u)
+        status = 2;
+    else {
+        length = (uint8_t)header->Size;
+        status = CW_StartTextPlayback((const char *)(pBuffer + sizeof(Header_t)), length);
+        if (status != 0)
+            length = 0;
+    }
+#else
+    (void)header;
+#endif
+
+    Reply.Header.ID = 0x0534;
+    Reply.Header.Size = 2;
+    Reply.Status = status;
+    Reply.Length = length;
+    SendReply(Port, &Reply, sizeof(Reply));
+}
+
 void UART_HandleCommand(uint32_t Port)
 {
     UART_Command_t *pUART_Command;
@@ -1075,6 +1113,10 @@ void UART_HandleCommand(uint32_t Port)
 
         case 0x0531:
             CMD_0531_SetVfo(Port, pUART_Command->Buffer);
+            break;
+
+        case 0x0533:
+            CMD_0533_SendMorse(Port, pUART_Command->Buffer);
             break;
 
         case 0x05DD: // reset
