@@ -45,7 +45,11 @@
 
 #include "functions.h"
 #include "misc.h"
+#include "radio.h"
 #include "settings.h"
+#ifdef ENABLE_CW_MODULATOR
+#include "app/cwkeyer.h"
+#endif
 #include "version.h"
 
 #ifdef ENABLE_FEAT_F4HWN_MULTIBOOT
@@ -891,6 +895,144 @@ static uint32_t mb_port_timestamp(uint32_t Port)
 }
 #endif
 
+/* Live VFO tune. Works on every preset that has USB or UART.
+ * Payload, after the 4-byte header:
+ *   VFO (0/1)
+ *   frequency in 10 Hz units LE (145.5 MHz = 14550000, 0xFFFFFFFF = keep)
+ *   modulation (0xFF = keep, else ModulationMode_t of this build)
+ *   bandwidth, only if Size >= 7 (0 = wide, 1 = narrow, 0xFF = keep)
+ * A 6-byte body is the original frequency/mode command. Bandwidth is the
+ * stored wide/narrow bit; the radio maps it per mode (FM 25k/12.5k,
+ * CW and USB 6.25k/2k when the extra filter is built in).
+ * Does not require ENABLE_EXTRA_UART_CMD or ENABLE_CW_MODULATOR.
+ * Applies through the same save path as keypad frequency entry. */
+static void CMD_0531_SetVfo(uint32_t Port, const uint8_t *pBuffer)
+{
+    typedef struct __attribute__((packed)) {
+        Header_t Header;
+        uint8_t  Vfo;
+        uint32_t Frequency;
+        uint8_t  Modulation;
+        uint8_t  Bandwidth;
+    } CMD_0531_t;
+
+    const CMD_0531_t *cmd = (const CMD_0531_t *)pBuffer;
+
+    struct __attribute__((packed)) {
+        Header_t Header;
+        uint8_t  Status;
+        uint8_t  Vfo;
+        uint32_t Frequency;
+        uint8_t  Modulation;
+        uint8_t  Bandwidth;
+    } Reply;
+
+    uint8_t status = 0;
+    uint32_t applied = 0;
+    uint8_t appliedMod = 0xFF;
+    uint8_t appliedBw = 0xFF;
+    const bool keepFreq = (cmd->Frequency == 0xFFFFFFFFu);
+    const uint8_t bandwidth = (cmd->Header.Size >= 7u) ? cmd->Bandwidth : 0xFFu;
+
+    if (cmd->Header.Size < 6u)
+        return;
+
+    if (cmd->Vfo > 1u)
+        status = 1;
+    else if (gCurrentFunction == FUNCTION_TRANSMIT)
+        status = 3;
+    else if (!keepFreq && RX_freq_check(cmd->Frequency) != 0)
+        status = 2;
+    else if (cmd->Modulation != 0xFFu && cmd->Modulation >= MODULATION_UKNOWN)
+        status = 4;
+    else if (bandwidth != 0xFFu && bandwidth > BANDWIDTH_NARROW)
+        status = 5;
+    else
+    {
+        const uint8_t vfo = cmd->Vfo;
+        VFO_Info_t *pVfo;
+
+        gEeprom.TX_VFO = vfo;
+
+        if (!keepFreq)
+        {
+            const FREQUENCY_Band_t band = FREQUENCY_GetBand(cmd->Frequency);
+            gEeprom.ScreenChannel[vfo] = (uint16_t)(FREQ_CHANNEL_FIRST + band);
+            gEeprom.FreqChannel[vfo] = (uint16_t)(FREQ_CHANNEL_FIRST + band);
+        }
+
+        RADIO_ConfigureChannel(vfo, VFO_CONFIGURE_RELOAD);
+
+        pVfo = &gEeprom.VfoInfo[vfo];
+        if (keepFreq)
+            applied = pVfo->freq_config_RX.Frequency;
+        else
+        {
+            applied = FREQUENCY_RoundToStep(cmd->Frequency, pVfo->StepFrequency);
+            if (RX_freq_check(applied) != 0)
+                applied = cmd->Frequency;
+            pVfo->freq_config_RX.Frequency = applied;
+        }
+
+        if (cmd->Modulation != 0xFFu)
+            pVfo->Modulation = (ModulationMode_t)cmd->Modulation;
+        if (bandwidth != 0xFFu)
+            pVfo->CHANNEL_BANDWIDTH = bandwidth;
+
+        appliedMod = (uint8_t)pVfo->Modulation;
+        appliedBw = pVfo->CHANNEL_BANDWIDTH;
+
+        gTxVfo = pVfo;
+        gRequestSaveChannel = 1;
+        gRequestSaveVFO = true;
+        gUpdateDisplay = true;
+    }
+
+    Reply.Header.ID = 0x0532;
+    Reply.Header.Size = 8;
+    Reply.Status = status;
+    Reply.Vfo = cmd->Vfo;
+    Reply.Frequency = applied;
+    Reply.Modulation = appliedMod;
+    Reply.Bandwidth = appliedBw;
+    SendReply(Port, &Reply, sizeof(Reply));
+}
+
+/* Send Morse for a text body. CW builds key it through the macro player.
+ * Other presets reply status 1. Reply 0x0534: status, accepted length.
+ * 0 started, 1 not CW, 2 empty or too long, 3 already sending. */
+static void CMD_0533_SendMorse(uint32_t Port, const uint8_t *pBuffer)
+{
+    const Header_t *header = (const Header_t *)pBuffer;
+    struct __attribute__((packed)) {
+        Header_t Header;
+        uint8_t  Status;
+        uint8_t  Length;
+    } Reply;
+
+    uint8_t status = 1;
+    uint8_t length = 0;
+
+#ifdef ENABLE_CW_MODULATOR
+    if (header->Size == 0u || header->Size >= 93u)
+        status = 2;
+    else {
+        length = (uint8_t)header->Size;
+        status = CW_StartTextPlayback((const char *)(pBuffer + sizeof(Header_t)), length);
+        if (status != 0)
+            length = 0;
+    }
+#else
+    (void)header;
+#endif
+
+    Reply.Header.ID = 0x0534;
+    Reply.Header.Size = 2;
+    Reply.Status = status;
+    Reply.Length = length;
+    SendReply(Port, &Reply, sizeof(Reply));
+}
+
 void UART_HandleCommand(uint32_t Port)
 {
     UART_Command_t *pUART_Command;
@@ -968,6 +1110,14 @@ void UART_HandleCommand(uint32_t Port)
             CMD_052F(Port, pUART_Command->Buffer);
             break;
 #endif
+
+        case 0x0531:
+            CMD_0531_SetVfo(Port, pUART_Command->Buffer);
+            break;
+
+        case 0x0533:
+            CMD_0533_SendMorse(Port, pUART_Command->Buffer);
+            break;
 
         case 0x05DD: // reset
             #if defined(ENABLE_OVERLAY)
@@ -1406,6 +1556,23 @@ void UART_HandleCommand(uint32_t Port)
         gUART_LockK5Viewer = 20; // lock the K5Viewer stream
     #endif
 }
+
+#if defined(ENABLE_UART)
+// Resynchronize the hardware-UART command parser with a freshly re-initialized
+// DMA channel. UART_Init() rebuilds DMA1 channel 2, which restarts the write
+// position at 0, but gUART_WriteIndex (the read position) is static and would
+// otherwise still point into the middle of the previous session's bytes. Stale
+// bytes above the reset write position can contain an 0xAB 0xCD pair, and the
+// "CommandLength < (Size + 8)" path in UART_IsCommandAvailable() returns without
+// resyncing the pointer - so the parser parks on the bogus frame and ignores
+// real traffic landing at index 0. Call this whenever UART_Init() is re-run
+// after boot (e.g. handing PA10 back from the CW port-ground mode).
+void UART_ResetRxParser(void)
+{
+    gUART_WriteIndex = 0;
+    memset(UART_DMA_Buffer, 0, sizeof(UART_DMA_Buffer));
+}
+#endif
 
 void UART_ServiceCommands(void)
 {

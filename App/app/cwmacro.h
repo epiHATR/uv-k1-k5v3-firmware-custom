@@ -103,8 +103,9 @@ void CW_StartRecording(uint8_t macroIndex);
 // Stop recording and save
 void CW_StopRecording(void);
 
-// TX character display buffer (for showing what's being transmitted)
-#define CW_TX_DISPLAY_SIZE 16
+// TX character display buffer (for showing what's being transmitted).
+// Sized for a full-width small-font marquee (~19 visible) plus scroll history.
+#define CW_TX_DISPLAY_SIZE 32
 extern char gCW_TX_Display[CW_TX_DISPLAY_SIZE];
 extern uint8_t gCW_TX_DisplayIndex;
 extern bool gCW_TX_DisplayUpdated;  // Flag: new data needs to be displayed

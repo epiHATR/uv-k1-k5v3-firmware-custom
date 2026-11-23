@@ -15,6 +15,7 @@ k5_eeprom.raw
 
 /build
 __pycache__/
+.venv/
 
 .DS_Store
 .working_docs

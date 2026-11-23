@@ -38,6 +38,7 @@
 #include "driver/backlight.h"
 #include "driver/system.h"
 #include "driver/millis.h"
+#include "ui/main.h"
 #ifdef ENABLE_CODE_PRACTICE
 #include "app/cpo.h"
 #endif
@@ -227,4 +228,6 @@ void CW_TimeSlice10ms(void)
 		if (--gCW_TxDisplayHoldoff_10ms == 0)
 			gUpdateDisplay = true;  // Trigger screen refresh to switch away from CW display
 	}
+
+	UI_MAIN_CWDecodeMarqueeTimeSlice10ms();
 }

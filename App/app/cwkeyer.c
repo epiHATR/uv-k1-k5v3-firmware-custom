@@ -24,6 +24,8 @@
 #include "app/cwkeyer.h"
 #include "app/cwhardware.h"
 #include "app/cwmacro.h"
+#include "functions.h"
+#include "radio.h"
 #include "audio.h"
 #include "settings.h"
 #include "misc.h"
@@ -156,6 +158,12 @@ static void CW_KeyerDeinit()
 {
     CW_KeyerResetRuntime();
 
+    // PA10 (USART1 RX) must be handed back first: CW_ConfigurePortGround(true)
+    // disabled USART1, stopped the RX DMA channel and left PA10 driving low, and
+    // nothing else in the firmware undoes that short of a power cycle. Leaving it
+    // captured kills the hardware serial port (CHIRP sees no reply at all, which
+    // surfaces as a "short header") for the rest of the session.
+    CW_ConfigurePortGround(false);
     CW_ConfigurePortRing(false); // make sure PB15 is an input with no pullup, to avoid affecting the line if shorted to mic (keyer rework)
     CW_ConfigureUsbPaddlePins(false); // restore PA11/PA12 to USB AF if USB paddle mode was active
 
@@ -270,14 +278,31 @@ static void CW_KeyerInit()
     // treats either port contact as the key - so PORT_GROUND alone is sufficient
     // to decide whether the ring pin should be configured.
     CW_ConfigurePortRing(uses_port_ground);
-    if (uses_port_ground)
-        CW_ConfigurePortGround(true);
+    // Unconditional, not "if (uses_port_ground)": switching straight from a port
+    // mode to a non-port CW mode never runs CW_KeyerDeinit(), so this is the only
+    // place that gives PA10/USART1 back in that path.
+    CW_ConfigurePortGround(uses_port_ground);
     CW_ConfigureUsbPaddlePins(uses_usb_port);
 
     gCW_KeyerUsingSD1 = (key_input_mode & CW_KEY_FLAG_SIDE1) != 0;
     s_last_key_input_mode = key_input_mode;
     s_enable_keyer = true;
     gCW_KeyerManagesPtt = true;
+}
+
+static void CW_ArmPlayback(bool repeat)
+{
+    s_playback_pos = 0;
+    s_play_elem_index = 0;
+    s_play_char_len = 0;
+    s_play_char_pattern = 0;
+    gCW_PlaybackRepeat = repeat;
+    gCW_MessageRepeatCountdown_500ms = 0;
+    CW_ClearTxDisplay();
+    s_play_space_pending = false;
+    s_pb_state = PB_STATE_INTER_CHAR_GAP;
+    s_elem_start_count = millis();
+    gCW_PlaybackActive = (s_playback_buf_len > 0);
 }
 
 // --- Macro playback API implementation ---
@@ -290,22 +315,8 @@ void CW_StartMacroPlayback(uint8_t macroIndex, bool repeat)
     memset(s_playback_buf, 0, sizeof(s_playback_buf));
     CW_LoadMacro(macroIndex, s_playback_buf, sizeof(s_playback_buf));
     s_playback_buf_len = (uint16_t)strlen(s_playback_buf);
-    s_playback_pos = 0;
     gCW_PlaybackMacroIndex = macroIndex;
-    s_play_elem_index = 0;
-    s_play_char_len = 0;
-    s_play_char_pattern = 0;
-
-    // Store repeat flag
-    gCW_PlaybackRepeat = repeat;
-    gCW_MessageRepeatCountdown_500ms = 0;  // Clear any pending countdown
-
-    // Clear TX display and prime the playback FSM to start immediately
-    CW_ClearTxDisplay();
-    s_play_space_pending = false;
-    s_pb_state = PB_STATE_INTER_CHAR_GAP;
-    s_elem_start_count = millis();
-    gCW_PlaybackActive = (s_playback_buf_len > 0);
+    CW_ArmPlayback(repeat);
 
 #if CW_KEYER_DEBUG
     if (gCW_PlaybackActive) {
@@ -314,6 +325,34 @@ void CW_StartMacroPlayback(uint8_t macroIndex, bool repeat)
         UART_Send(buf, strlen(buf));
     }
 #endif
+}
+
+uint8_t CW_StartTextPlayback(const char *text, uint8_t length)
+{
+    uint8_t n = 0;
+
+    if (gCW_Recording || gCW_PlaybackActive || gCurrentFunction == FUNCTION_TRANSMIT)
+        return 3;
+    if (gTxVfo == NULL || gTxVfo->Modulation != MODULATION_CW)
+        return 1;
+    if (text == NULL || length == 0 || length >= sizeof(s_playback_buf))
+        return 2;
+
+    memset(s_playback_buf, 0, sizeof(s_playback_buf));
+    for (uint8_t i = 0; i < length; i++) {
+        char ch = text[i];
+        if (ch >= 'a' && ch <= 'z')
+            ch = (char)(ch - 'a' + 'A');
+        if (ch == ' ' || CW_ValidateChar(ch))
+            s_playback_buf[n++] = ch;
+    }
+    if (n == 0)
+        return 2;
+
+    s_playback_buf_len = n;
+    gCW_PlaybackMacroIndex = 0;
+    CW_ArmPlayback(false);
+    return gCW_PlaybackActive ? 0 : 2;
 }
 
 // Stop playback immediately (user interrupted)

@@ -853,29 +853,76 @@ void UI_DisplayAudioBar(void)
 #endif
 
 #ifdef ENABLE_CW_MODULATOR
+/* Kept so the 10 ms tick still has a call site. The decode line no longer
+ * walks the string across the screen; see DrawCWDecodeBar. */
+void UI_MAIN_CWDecodeMarqueeTimeSlice10ms(void)
+{
+	/* Decode text is drawn in place. This tick used to scroll it. */
+}
+
+/* Small font, one column at a time, so a glyph can sit partly off the zone
+ * without being dropped. Matches UI_PrintStringBuffer's 1 px left pad. */
+static void UI_MAIN_BlitSmallClipped(const char *text, int startX, uint8_t *line,
+                                     unsigned int clipL, unsigned int clipR)
+{
+	const unsigned int pitch = FONT_SMALL_WIDTH + 1u;
+
+	for (unsigned int i = 0; text[i] != '\0'; i++) {
+		const int cell = startX + (int)(i * pitch);
+		if (cell + (int)pitch <= (int)clipL || cell >= (int)clipR)
+			continue;
+		if (text[i] <= ' ' || text[i] >= 127)
+			continue;
+
+		const unsigned int index = (unsigned int)(text[i] - ' ' - 1);
+		uint16_t bit = (uint16_t)(index * FONT_SMALL_WIDTH * 7u);
+
+		for (uint8_t column = 0; column < FONT_SMALL_WIDTH; column++) {
+			const int x = cell + 1 + (int)column;
+			const uint16_t byte = bit >> 3;
+			const uint16_t packed = gFontSmallPacked[byte] | ((uint16_t)gFontSmallPacked[byte + 1u] << 8);
+
+			if (x >= (int)clipL && x < (int)clipR)
+				line[x] = (uint8_t)((packed >> (bit & 7u)) & 0x7Fu);
+			bit = (uint16_t)(bit + 7u);
+		}
+	}
+}
+
 void DrawCWDecodeBar(void)
 {
-	const unsigned int line = 3;
+	/* Main-only / big-freq uses line 5; dual-VFO keeps the middle gap on line 3. */
+#ifdef ENABLE_FEAT_F4HWN
+	const unsigned int line = isMainOnly() ? 5u : 3u;
+#else
+	const unsigned int line = 3u;
+#endif
 	uint8_t *p_line = gFrameBuffer[line];
-	char String[20];
-	
+	char String[CW_TX_DISPLAY_SIZE];
+	const unsigned int textLeft = sizeof(BITMAP_Play) + 2u; /* play glyph + gap */
+	const unsigned int zoneW = LCD_WIDTH - textLeft;
+
 	if (gScreenToDisplay != DISPLAY_MAIN)
-		return;  // screen is in use
-	
+		return;
+
 	memset(p_line, 0, LCD_WIDTH);
-	
-	// Get the last 20 characters from display buffer
-	CW_GetTxDisplayTail(String, sizeof(String));
 
-	// Print the text shifted right so glyph can be placed at x=0; print text first
-	UI_PrintStringSmallNormal(String, 10, 0, line);
+	const uint8_t len = CW_GetTxDisplayTail(String, sizeof(String));
 
-	// Draw glyph after text so it can't be clobbered (drawn independently of DecodeBar)
+	if (len > 0 && zoneW > 0) {
+		const unsigned int pitch = FONT_SMALL_WIDTH + 1u;
+		const unsigned int textW = len * pitch;
+		/* Fits: hold still at the left. Wider: keep the characters just
+		 * decoded on screen and clip the older ones off the left. */
+		const unsigned int offset = (textW > zoneW) ? (textW - zoneW) : 0u;
+
+		UI_MAIN_BlitSmallClipped(String, (int)textLeft - (int)offset, p_line, textLeft, LCD_WIDTH);
+	}
+
 	if (gCW_PlaybackActive && (center_line == CENTER_LINE_NONE || center_line == CENTER_LINE_CW_DECODE)) {
 		if (gCW_PlayIndicatorOn) {
 			memcpy(p_line + 0, BITMAP_Play, sizeof(BITMAP_Play));
 		} else {
-			// clear the glyph area
 			memset(p_line + 0, 0, sizeof(BITMAP_Play));
 		}
 	}
@@ -2363,26 +2410,39 @@ void UI_DisplayMain(void)
 #if ENABLE_FEAT_F4HWN
         const uint8_t displayBandwidth = vfoInfo->CHANNEL_BANDWIDTH;
 
+#ifdef ENABLE_EXTRA_FILTER
+        // CW and SSB resolve the same wide/narrow bit to 6.25k and 2.0k, so
+        // W/N here would read as the FM widths and mislead the operator. Name
+        // the filter instead - within these modes the pair is unambiguous, and
+        // it matches what the Filter submenu offers.
+        if (
+    #ifdef ENABLE_CW_MODULATOR
+            vfoInfo->Modulation == MODULATION_CW ||
+    #endif
+            vfoInfo->Modulation == MODULATION_USB)
+        {
+            const char *ssbName = (displayBandwidth == BANDWIDTH_WIDE) ? "6k" : "2k";
+
+            if (gSetting_set_gui)
+                UI_PrintStringSmallNormal(ssbName, LCD_WIDTH + 80, 0, line + 1);
+            else
+                GUI_DisplaySmallest(ssbName, 91, line == 0 ? 17 : 49, false, true);
+        }
+        else
+#endif
+        {
         #ifdef ENABLE_FEAT_F4HWN_NARROWER
+            // SetNFM upgrades FM's narrow to 6.25k, so "N+" says something
+            // here. CW/SSB never reach this branch when the extra filter is
+            // compiled in; without it they share the FM widths and the upgrade
+            // applies to them too, so no modulation test is needed either way.
             bool narrower = 0;
 
-            if(displayBandwidth == BANDWIDTH_NARROW && gSetting_set_nfm == 1)
+            if (displayBandwidth == BANDWIDTH_NARROW && gSetting_set_nfm == 1)
             {
                 narrower = 1;
             }
 
-#ifdef ENABLE_EXTRA_FILTER
-            if (displayBandwidth == BANDWIDTH_NARROWEST)
-            {
-                // BANDWIDTH_NARROWEST is a distinct per-channel setting (not the F4HWN
-                // narrower mode upgrade); show its own label rather than "N+".
-                if (gSetting_set_gui)
-                    UI_PrintStringSmallNormal("2k", LCD_WIDTH + 80, 0, line + 1);
-                else
-                    GUI_DisplaySmallest("2k", 91, line == 0 ? 17 : 49, false, true);
-            }
-            else
-#endif
             if (gSetting_set_gui)
             {
                 const char *bandWidthNames[] = {"W", "N", "N+"};
@@ -2396,32 +2456,19 @@ void UI_DisplayMain(void)
         #else
             if (gSetting_set_gui)
             {
-#ifdef ENABLE_EXTRA_FILTER
-                const char *bandWidthNames[] = {"W", "N", "2k"};
-                UI_PrintStringSmallNormal(bandWidthNames[vfoInfo->CHANNEL_BANDWIDTH], LCD_WIDTH + 80, 0, line + 1);
-#else
                 const char *bandWidthNames[] = {"W", "N"};
                 UI_PrintStringSmallNormal(bandWidthNames[displayBandwidth], LCD_WIDTH + 80, 0, line + 1);
-#endif
             }
             else
             {
-#ifdef ENABLE_EXTRA_FILTER
-                const char *bandWidthNames[] = {"WIDE", "NAR", "2k"};
-                GUI_DisplaySmallest(bandWidthNames[vfoInfo->CHANNEL_BANDWIDTH], 91, line == 0 ? 17 : 49, false, true);
-#else
                 const char *bandWidthNames[] = {"WIDE", "NAR"};
                 GUI_DisplaySmallest(bandWidthNames[displayBandwidth], 91, line == 0 ? 17 : 49, false, true);
-#endif
             }
         #endif
+        }
 #else
         if (vfoInfo->CHANNEL_BANDWIDTH == BANDWIDTH_NARROW)
             UI_PrintStringSmallNormal("N", LCD_WIDTH + 70, 0, line + 1);
-#ifdef ENABLE_EXTRA_FILTER
-		else if (vfoInfo->CHANNEL_BANDWIDTH == BANDWIDTH_NARROWEST)
-			UI_PrintStringSmallNormal("2k", LCD_WIDTH + 70, 0, line + 1);
-#endif
 #endif
 
 #ifdef ENABLE_DTMF_CALLING

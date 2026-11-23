@@ -71,6 +71,10 @@ static const AddrMapping_t ADDR_MAPPINGS[] = {
                                                 // Settings F4HWN * 8 Bytes (0x00C000)      0x00A158 -> 0x00A160
                                                 // Settings Version * 16 Bytes              0x00A160 -> 0x00A170
                                                 // Settings Mixed Scan Lists * 8 Bytes      0x00A170 -> 0x00A178
+                                                // EEPROM schema marker is the spare byte
+                                                // at 0x00A177 (see EEPROM_SCHEMA_ADDR).
+                                                // It must stay inside this window or
+                                                // CHIRP's serial read returns 0xFF.
 
     _MK_MAPPING(0x010000, 0x00B000, 0x00B200),  // Calibration 512 Bytes!!!
 

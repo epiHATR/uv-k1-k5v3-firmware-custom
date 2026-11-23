@@ -54,6 +54,9 @@ void UI_DisplayAudioScopeOverlay(uint8_t line, bool active);
 #ifdef ENABLE_FEAT_F4HWN_AUDIO_SCOPE
 void UI_DisplayAudioScope(void);
 #endif
+#ifdef ENABLE_CW_MODULATOR
+void UI_MAIN_CWDecodeMarqueeTimeSlice10ms(void);
+#endif
 void UI_MAIN_TimeSlice500ms(void);
 void UI_DisplayMain(void);
 #ifdef ENABLE_FEAT_F4HWN_FULL_WATCH
